@@ -240,6 +240,44 @@ describe('loop signal file', () => {
   });
 });
 
+describe('signal housekeeping', () => {
+  it('removes signals whose goal no longer exists', async () => {
+    // A bridge killed between the agent writing a signal and the round reading
+    // it leaves the file behind; if the user then starts a *new* goal instead
+    // of resuming, nothing ever looks at that path again.
+    const orphan = controller.signalPath('long-gone-goal', 3);
+    await prepareGoalSignal(orphan);
+    await writeFile(orphan, '半路挂了');
+
+    expect(await controller.sweepSignals(Date.now() + 2 * HOUR)).toBe(1);
+    expect(await readGoalSignal(orphan)).toEqual({ kind: 'none' });
+  });
+
+  it('leaves a live goal signal alone', async () => {
+    const state = start();
+    const live = controller.signalPath(state.id, 1);
+    await prepareGoalSignal(live);
+    await writeFile(live, '还在跑');
+
+    expect(await controller.sweepSignals(Date.now() + 2 * HOUR)).toBe(0);
+    expect(await readGoalSignal(live)).toEqual({ kind: 'continue', reason: '还在跑' });
+  });
+
+  it('leaves a just-written orphan for the next startup', async () => {
+    // Another process sharing this profile could have written it moments ago.
+    const fresh = controller.signalPath('someone-elses-goal', 1);
+    await prepareGoalSignal(fresh);
+    await writeFile(fresh, '别人的');
+
+    expect(await controller.sweepSignals(Date.now())).toBe(0);
+  });
+
+  it('does nothing when there is no signal directory yet', async () => {
+    const virgin = new GoalController(join(dir, 'never-used', 'goals.json'));
+    expect(await virgin.sweepSignals(Date.now())).toBe(0);
+  });
+});
+
 describe('loading goals written by an older bridge', () => {
   it('mints an id for a record that has none', async () => {
     // Without an id `expectId` checks are skipped and every such goal shares

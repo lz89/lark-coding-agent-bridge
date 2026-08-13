@@ -1,5 +1,5 @@
 import { randomUUID } from 'node:crypto';
-import { mkdir, readFile, rm } from 'node:fs/promises';
+import { mkdir, readdir, readFile, rm, stat } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { log } from '../core/logger';
@@ -31,6 +31,15 @@ const HOURS_CEILING = 72;
 const STUCK_REPEATS = 3;
 /** Continuation reasons are echoed into prompts and cards; keep them short. */
 const REASON_MAX_CHARS = 500;
+/**
+ * How old an orphaned signal must be before startup housekeeping removes it.
+ *
+ * Startup means no round of *this* bridge is in flight, but a second process
+ * sharing the profile could have written one moments ago. Anything younger is
+ * left for the next startup — the point is bounding accumulation, not
+ * reclaiming a few bytes promptly.
+ */
+const SIGNAL_ORPHAN_GRACE_MS = 3_600_000;
 
 export interface GoalState {
   /**
@@ -254,6 +263,43 @@ export class GoalController {
     this.schedulePersist();
     log.info('goal', 'resume', { scope, round: next.round });
     return next;
+  }
+
+  /**
+   * Delete continuation signals no goal can ever read again.
+   *
+   * A signal is consumed when its round is read; a bridge killed between the
+   * agent writing one and the round reading it leaves the file behind, and if
+   * that goal is then replaced rather than resumed, nothing ever looks at its
+   * path again. Called at startup, where no round can be in flight by
+   * definition — but still restricted to unknown goal ids and week-old files,
+   * so a second process sharing the profile cannot lose a live round's signal.
+   */
+  async sweepSignals(now: number): Promise<number> {
+    const live = new Set(Object.values(this.data.entries).map((state) => state.id));
+    let removed = 0;
+    let names: string[];
+    try {
+      names = await readdir(this.signalDir);
+    } catch {
+      return 0;
+    }
+    for (const name of names) {
+      const id = name.split('.')[0];
+      if (id && live.has(id)) continue;
+      const path = join(this.signalDir, name);
+      try {
+        const info = await stat(path);
+        if (now - info.mtimeMs < SIGNAL_ORPHAN_GRACE_MS) continue;
+        await rm(path, { force: true });
+        removed++;
+      } catch {
+        // Raced with something else removing it, or unreadable — either way
+        // this is best-effort housekeeping and must never fail a startup.
+      }
+    }
+    if (removed > 0) log.info('goal', 'signals-swept', { removed });
+    return removed;
   }
 
   async flush(): Promise<void> {
