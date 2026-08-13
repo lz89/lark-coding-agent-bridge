@@ -151,6 +151,7 @@ If a profile was created with the wrong agent kind, stop or unregister any match
 | `/invite group` | Allow the current group to use the bot |
 | `/invite all group` | Allow all groups the bot has joined |
 | `/remove user @name`, `/remove admin @name`, `/remove group` | Remove access entries |
+| `/goal <goal>` | Pursue a goal across as many runs as it takes (`/goal` for status, `/goal off` to stop) |
 | `/stop` | Stop the current run, including the card stop button |
 | `/timeout [N\|off\|default]` | Set or clear the current session idle watchdog |
 | `/ps` | List local bridge processes |
@@ -160,6 +161,30 @@ If a profile was created with the wrong agent kind, stop or unregister any match
 | `/help` | Help card |
 
 DMs do not require an @ mention. Groups and topic groups require `@bot` by default; `@all` is ignored. Cloud-doc comments in supported document types run when the bot is mentioned.
+
+## Goal mode (`/goal`)
+
+A headless `claude -p` / `codex exec` run is one-shot. When the turn ends the process is gone, so anything the agent promised to do "afterwards" never happens — and a job it detached with `nohup` survives only to *notify*, never to check the result and decide what to do next. Work that genuinely needs several rounds has nowhere to live.
+
+`/goal <goal>` closes that. After each round the bridge asks whether the goal is closed; if not, it starts another round on the same session, so the agent resumes with its full context. The work spans as many runs as it needs while staying one conversation.
+
+```
+/goal 部署新二进制并跑出第一个基线数字
+```
+
+Each round replies as usual, with `🔁 3/20` on the footer so a round-three progress report is not mistaken for an answer to whatever was asked last. Anything you send mid-goal is folded into the next round rather than waiting for the whole thing to finish, so you can steer without stopping it.
+
+**Signalling is opt-out: silence ends it.** Each round gets its own signal file, and the agent must write the next step into it to earn another round. An agent that crashes, is interrupted, or simply forgets therefore *stops* — the cost of that failure is one "继续" from you, rather than an unattended run of API calls. A round's file is per-round, so a leftover one can never trigger a later round.
+
+It stops on any of:
+
+- the agent leaving the signal file unwritten (the goal is closed)
+- `goalMaxRounds` rounds, default 20
+- `goalMaxHours` elapsed, default 8
+- three rounds in a row giving the identical reason — restating a blocker is not progress
+- `/stop` or `/goal off`
+
+Every ending posts why, and whether the goal was actually reached. A bridge restart kills the in-flight run, so the goal is parked rather than resumed silently: the chat gets a notice and `/goal resume` picks it back up from the round it reached.
 
 ## Reply Display and COT
 

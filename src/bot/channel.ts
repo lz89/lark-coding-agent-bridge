@@ -44,6 +44,8 @@ import type { AppConfig } from '../config/schema';
 import {
   getAgentStopGraceMs,
   getCotMessages,
+  getGoalMaxHours,
+  getGoalMaxRounds,
   getMaxConcurrentRuns,
   getMessageReplyMode,
   getRunIdleTimeoutMs,
@@ -71,6 +73,15 @@ import type { WorkspaceStore } from '../workspace/store';
 import { ActiveRuns, type RunHandle } from './active-runs';
 import { ChatModeCache, type ChatMode } from './chat-mode-cache';
 import { handleCommentMention } from './comments';
+import {
+  GoalController,
+  goalContinuationTurn,
+  goalProtocolInstruction,
+  goalSignalPath,
+  goalStopText,
+  prepareGoalSignal,
+  readGoalSignal,
+} from './goal';
 import { recordRunSessionEvent, startRunFlow } from './run-flow';
 import { commandSessionCatalogIdentity } from './session-catalog-identity';
 import { startKeepalive } from './keepalive';
@@ -211,6 +222,13 @@ export async function startChannel(deps: StartChannelDeps): Promise<BridgeChanne
   // so /config bumps take effect for the next run.
   const pool = new ProcessPool(() => getMaxConcurrentRuns(controls.cfg));
   const executor = new RunExecutor({ agent, pool, activeRuns });
+  // `/goal` continuation state. Persisted next to the other per-profile
+  // state so a restart — which kills every in-flight run — can still tell the
+  // user which goal it cut off, and let them resume it.
+  const goals = new GoalController(
+    deps.appPaths?.mediaDir ? join(dirname(deps.appPaths.mediaDir), 'goals.json') : undefined,
+  );
+  await goals.load();
 
   // Resolve the App Secret to plaintext. The config field can be a literal
   // string, a "${VAR}" template, or a {source, id} SecretRef referencing
@@ -324,7 +342,7 @@ export async function startChannel(deps: StartChannelDeps): Promise<BridgeChanne
             threadId: firstMsg.threadId,
           });
         }
-        await runAgentBatch({
+        await driveScopeRun({
           channel,
           executor,
           sessions,
@@ -339,6 +357,8 @@ export async function startChannel(deps: StartChannelDeps): Promise<BridgeChanne
           lastRunModelByScope,
           scope,
           mode,
+          goals,
+          pending,
         });
       } catch (err) {
         log.fail('flush', err);
@@ -369,6 +389,7 @@ export async function startChannel(deps: StartChannelDeps): Promise<BridgeChanne
           logThreadModeOverride,
           executor,
           pool,
+          goals,
         }),
       ).catch((err) => log.fail('intake', err));
     },
@@ -513,6 +534,21 @@ export async function startChannel(deps: StartChannelDeps): Promise<BridgeChanne
   });
   console.log('正在监听消息。按 Ctrl+C 退出。\n');
 
+  // A restart kills every run, so any loop still marked active was cut off
+  // mid-goal. Tell its chat rather than resuming silently: restarts are
+  // usually deploys, and firing agent runs at boot is not something the user
+  // asked for at that moment.
+  for (const cut of goals.markInterrupted()) {
+    void channel
+      .send(cut.chatId, {
+        markdown:
+          `⚠️ bridge 重启,闭环任务被打断(已完成 ${cut.round} 轮)。\n\n` +
+          `目标:${cut.goal}\n\n` +
+          '要接着跑发 `/goal resume`;不需要就忽略这条。',
+      })
+      .catch((err) => log.warn('goal', 'restart-notice-failed', { err: String(err) }));
+  }
+
   // App-level keepalive: 15s probe + wake-up detection + HTTP reachability.
   // Defense-in-depth — the SDK's pingTimeout watchdog handles half-dead WS,
   // this catches anything that the SDK misses (silent state stuck, etc.).
@@ -645,6 +681,7 @@ interface IntakeDeps {
   logThreadModeOverride: LogThreadModeOverride;
   executor: RunExecutor;
   pool: ProcessPool;
+  goals: GoalController;
 }
 
 type LogThreadModeOverride = (input: {
@@ -668,6 +705,7 @@ async function intakeMessage(deps: IntakeDeps): Promise<void> {
     logThreadModeOverride,
     executor,
     pool,
+    goals,
   } = deps;
   const preview = msg.content.length > 80 ? `${msg.content.slice(0, 80)}…` : msg.content;
   // Resolve scope (and underlying chat mode) once at intake — every
@@ -775,11 +813,19 @@ async function intakeMessage(deps: IntakeDeps): Promise<void> {
     return;
   }
 
+  // A command that starts work (`/goal <目标>`) hands the turn back here as
+  // text rather than launching a run itself, so it goes through the same
+  // debounce → batch → run path as anything the user types.
+  let queuedTask: string | undefined;
   const handled = await tryHandleCommand({
     channel,
     msg: emsg,
     scope,
     chatMode,
+    goals,
+    enqueueTask: (content: string) => {
+      queuedTask = content;
+    },
     sessions,
     workspaces,
     agent,
@@ -800,6 +846,8 @@ async function intakeMessage(deps: IntakeDeps): Promise<void> {
   if (handled) {
     const dropped = pending.cancel(scope);
     log.info('intake', 'command', { scope, droppedPending: dropped.length });
+    // Pushed after the cancel above, or it would be dropped as stale chatter.
+    if (queuedTask !== undefined) pending.push(scope, { ...emsg, content: queuedTask });
     return;
   }
 
@@ -822,6 +870,135 @@ interface RunBatchDeps {
   lastRunModelByScope: Map<string, string>;
   scope: string;
   mode: ChatMode;
+  /** Set when this run is one round of a `/goal` continuation. */
+  goalMode?: GoalRunContext;
+}
+
+interface GoalRunContext {
+  /** Protocol text (including this round's signal path) for the prompt. */
+  instruction: string;
+  round: number;
+  maxRounds: number;
+}
+
+interface GoalDriveDeps extends Omit<RunBatchDeps, 'goalMode' | 'batch'> {
+  batch: NormalizedMessage[];
+  goals: GoalController;
+  pending: PendingQueue;
+}
+
+/**
+ * Run one batch — then keep running it until the goal is closed, if this scope
+ * has an active `/goal`.
+ *
+ * Everything a continuation round needs (session, cwd, card routing, watchdogs)
+ * already lives in `runAgentBatch`, so a round is just another call to it with
+ * a synthetic user turn. That keeps a looped run and a normal run literally the
+ * same code path, rather than a second, thinner one that drifts.
+ */
+async function driveScopeRun(deps: GoalDriveDeps): Promise<void> {
+  const { goals, pending, controls, channel, scope, mode } = deps;
+  const anchor = deps.batch[0];
+  if (!anchor) return;
+  let batch = deps.batch;
+
+  for (;;) {
+    const state = goals.get(scope);
+    let goalMode: GoalRunContext | undefined;
+    let signalPath: string | undefined;
+    if (state) {
+      const round = state.round + 1;
+      signalPath = goalSignalPath(scope, round);
+      await prepareGoalSignal(signalPath);
+      goalMode = {
+        round,
+        maxRounds: state.maxRounds,
+        instruction: goalProtocolInstruction({
+          goal: state.goal,
+          round,
+          maxRounds: state.maxRounds,
+          signalPath,
+          deadlineAt: state.deadlineAt,
+          now: Date.now(),
+        }),
+      };
+    }
+
+    await runAgentBatch({ ...deps, batch, ...(goalMode ? { goalMode } : {}) });
+    if (!state || !signalPath) return;
+
+    const reason = await readGoalSignal(signalPath);
+    // Re-read rather than trusting the snapshot: `/stop` and `/goal off` run
+    // during the round, and a loop cancelled mid-round must not get one more.
+    if (!goals.get(scope)) return;
+    if (!reason) {
+      const ended = goals.end(scope, 'done');
+      if (ended) await sendGoalNotice(channel, anchor, mode, goalStopText('done', ended));
+      return;
+    }
+
+    const advance = goals.advance(scope, reason, Date.now());
+    if (!advance) return;
+    if (!advance.ok) {
+      await sendGoalNotice(channel, anchor, mode, goalStopText(advance.stop, advance.state));
+      return;
+    }
+
+    // Anything the user said mid-round joins the next one instead of waiting
+    // for the whole loop to finish — otherwise a steer sent at round 3 of 20
+    // sits unread for hours.
+    const queued = pending.cancel(scope);
+    if (queued.length > 0) {
+      log.info('goal', 'merged-user-messages', { scope, count: queued.length });
+    }
+    batch = [
+      continuationMessage(
+        anchor,
+        goalContinuationTurn({
+          round: advance.state.round + 1,
+          goal: advance.state.goal,
+          reason,
+        }),
+      ),
+      ...queued,
+    ];
+  }
+}
+
+/**
+ * A synthetic user turn for a continuation round.
+ *
+ * Keeps the anchor's identity and routing (its `messageId` is what replies are
+ * threaded to, so it has to stay a message Feishu knows) while dropping
+ * everything that would be re-processed: attachments would be re-uploaded and
+ * the quoted message re-fetched, once per round, for the whole loop.
+ */
+function continuationMessage(anchor: NormalizedMessage, content: string): NormalizedMessage {
+  return {
+    ...anchor,
+    content,
+    resources: [],
+    mentions: [],
+    replyToMessageId: undefined,
+    raw: undefined,
+  } as unknown as NormalizedMessage;
+}
+
+/** Why a loop ended, posted where the loop's own replies went. */
+async function sendGoalNotice(
+  channel: LarkChannel,
+  anchor: NormalizedMessage,
+  mode: ChatMode,
+  text: string,
+): Promise<void> {
+  try {
+    await channel.send(anchor.chatId, { markdown: text }, {
+      replyTo: anchor.messageId,
+      ...(mode === 'topic' && anchor.threadId ? { replyInThread: true } : {}),
+    });
+  } catch (err) {
+    log.warn('goal', 'notice-failed', { chatId: anchor.chatId, err: String(err) });
+  }
 }
 
 async function runAgentBatch(deps: RunBatchDeps): Promise<void> {
@@ -840,6 +1017,7 @@ async function runAgentBatch(deps: RunBatchDeps): Promise<void> {
     lastRunModelByScope,
     scope,
     mode,
+    goalMode,
   } = deps;
   if (batch.length === 0) return;
   const firstMsg = batch[0];
@@ -927,12 +1105,18 @@ async function runAgentBatch(deps: RunBatchDeps): Promise<void> {
   const prevModel = lastRunModelByScope.get(scope);
   const modelSwitched = prevModel !== undefined && prevModel !== modelSelection;
   lastRunModelByScope.set(scope, modelSelection);
-  const extraInstructions = modelSwitched
-    ? [
-        `用户刚把本会话使用的模型切换为「${modelLabel(agentKind, modelPref)}」。` +
-          '之前的对话里可能提到别的模型,请以当前模型为准;若被问到你用的是什么模型,据此回答。',
-      ]
-    : undefined;
+  const instructions: string[] = [];
+  if (modelSwitched) {
+    instructions.push(
+      `用户刚把本会话使用的模型切换为「${modelLabel(agentKind, modelPref)}」。` +
+        '之前的对话里可能提到别的模型,请以当前模型为准;若被问到你用的是什么模型,据此回答。',
+    );
+  }
+  // Restated every round on purpose — the signal path is per-round, so a
+  // continuation that reused the previous round's instruction would write to a
+  // file nobody reads and the loop would end looking like the agent was done.
+  if (goalMode) instructions.push(goalMode.instruction);
+  const extraInstructions = instructions.length > 0 ? instructions : undefined;
 
   const prompt = buildPrompt(
     batch,
@@ -1076,11 +1260,15 @@ async function runAgentBatch(deps: RunBatchDeps): Promise<void> {
   // effect immediately. Cheap object lookups, no allocation when on.
   const runEffort = resolveEffortArg(agentKind, controls.profileConfig.preferences.effort);
   const filterForPrefs = (state: RunState): RunState => {
-    // Effort never arrives as an agent event — it's what we launched with, so
-    // it's stamped on at render time rather than tracked through the stream.
-    const withEffort = runEffort ? withMeta(state, { effort: runEffort }) : state;
-    if (getShowToolCalls(controls.cfg)) return withEffort;
-    return { ...withEffort, blocks: withEffort.blocks.filter((b) => b.kind !== 'tool') };
+    // Effort and loop round never arrive as agent events — they're what we
+    // launched with, so they're stamped on at render time rather than tracked
+    // through the stream.
+    const stamped = withMeta(state, {
+      ...(runEffort ? { effort: runEffort } : {}),
+      ...(goalMode ? { goalRound: goalMode.round, goalMaxRounds: goalMode.maxRounds } : {}),
+    });
+    if (getShowToolCalls(controls.cfg)) return stamped;
+    return { ...stamped, blocks: stamped.blocks.filter((b) => b.kind !== 'tool') };
   };
   const cardRenderOptions = callbackAuth
     ? {
