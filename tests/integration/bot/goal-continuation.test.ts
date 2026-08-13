@@ -194,6 +194,21 @@ describe('goal continuation', () => {
     expect(h.texts().at(-1)).toContain('目标未完成');
   });
 
+  it('does not call a silent process exit an achieved goal', async () => {
+    // claude exiting 0 with empty or unparseable output ends the stream with no
+    // terminal event; `done` is then synthesised so the card is not left
+    // mid-stream. Reading that as the agent reporting success would announce a
+    // goal achieved by a process that vanished without a word.
+    const h = await createHarness([undefined]);
+    h.agent.silentExitRounds.add(1);
+    await startTestBridge(h);
+
+    await h.send('/goal 目标');
+    await h.settleAt(1);
+
+    expect(h.texts().at(-1)).toContain('目标未完成');
+  });
+
   it('keeps going when the round finished but its reply failed to send', async () => {
     // The agent reached the end and asked for another round; only delivery
     // broke. Ending the goal there would let one Feishu blip kill hours of
@@ -254,6 +269,8 @@ class ScriptedAgent implements AgentAdapter {
   failRounds = new Set<number>();
   /** Rounds that write their signal and *then* die. */
   errorAfterSignalRounds = new Set<number>();
+  /** Rounds whose stream just stops, with no terminal event at all. */
+  silentExitRounds = new Set<number>();
 
   constructor(private readonly script: Array<string | undefined>) {}
 
@@ -271,6 +288,7 @@ class ScriptedAgent implements AgentAdapter {
     const reason = this.script[round - 1];
     const shouldFail = this.failRounds.has(round);
     const dieAfterSignal = this.errorAfterSignalRounds.has(round);
+    const endWithoutDone = this.silentExitRounds.has(round);
     // Read the path out of the prompt, exactly as a real agent has to — which
     // also means a round whose prompt carries no path cannot signal at all.
     // Every prompt section is JSON-encoded (see `promptSection`), so the path
@@ -286,6 +304,9 @@ class ScriptedAgent implements AgentAdapter {
       await new Promise((resolve) => setTimeout(resolve, ROUND_HOLD_MS));
       if (dieAfterSignal) throw new Error('tool wedged after the signal was written');
       yield { type: 'text', delta: `第 ${round} 轮进度。` };
+      // Real agents say when they are finished. A stream that merely ends gets
+      // `done` synthesised, which a goal must not read as "the agent finished".
+      if (!endWithoutDone) yield { type: 'done', terminationReason: 'normal' };
     })();
     return {
       runId: opts.runId,
