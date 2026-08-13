@@ -1333,10 +1333,16 @@ async function runAgentBatch(deps: RunBatchDeps): Promise<RoundOutcome> {
     log.info('flush', 'tool-stall-watchdog', { toolStallTimeoutMs, toolStallGraceMs });
   }
 
-  // Terminal state of this round's run, recorded wherever the stream resolves.
+  // Outcome of this round's run, recorded wherever the stream resolves.
   let roundTerminal: Terminal | undefined;
+  // `terminal: 'done'` alone is not the agent saying it finished: a stream that
+  // just ends gets `done` synthesised so the card is not left mid-stream, and
+  // for a goal that is the difference between "achieved" and "the process
+  // vanished without a word".
+  let roundEndSynthesised = false;
   const trackTerminal = (state: RunState): RunState => {
     roundTerminal = state.terminal;
+    roundEndSynthesised = state.endedWithoutTerminalEvent === true;
     return state;
   };
   /**
@@ -1344,7 +1350,7 @@ async function runAgentBatch(deps: RunBatchDeps): Promise<RoundOutcome> {
    * the reply-path catches handled it (that is where a broken adapter lands,
    * not in the outer catch). Either way the run did not reach `done`.
    */
-  const runReachedDone = (): boolean => roundTerminal === 'done';
+  const runReachedDone = (): boolean => roundTerminal === 'done' && !roundEndSynthesised;
   const outcome = (): RoundOutcome => (runReachedDone() ? 'completed' : 'run-failed');
 
   const replyMode = getMessageReplyMode(controls.cfg);

@@ -55,6 +55,14 @@ export interface RunState {
   stalled?: StallNotice;
   /** What the run footer reports. See {@link RunMeta}. */
   meta?: RunMeta;
+  /**
+   * Set when `done` was synthesised from the stream simply ending, rather than
+   * reported by the agent — claude exiting 0 with empty or unparseable output,
+   * a truncated JSONL, a killed subprocess. The card renders it as an ordinary
+   * finish (leaving it mid-stream would be worse), but callers deciding
+   * *whether the work got done* must not read it as the agent saying so.
+   */
+  endedWithoutTerminalEvent?: boolean;
 }
 
 /**
@@ -260,5 +268,6 @@ export function finalizeIfRunning(state: RunState): RunState {
     reasoning: { ...state.reasoning, active: false },
     terminal: 'done',
     footer: null,
+    endedWithoutTerminalEvent: true,
   };
 }
