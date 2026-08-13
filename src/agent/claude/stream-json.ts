@@ -25,11 +25,14 @@ interface ClaudeRawEvent {
     cache_read_input_tokens?: number;
     cache_creation_input_tokens?: number;
     /**
-     * Per-request breakdown for the run's **final** assistant message. The
-     * sibling totals are cumulative over every request the agentic loop made,
-     * so they are the only usable source for context size.
+     * Per-attempt usage for a single assistant message — measured to be the
+     * run's last one (see `contextFromIterations`). The sibling totals are
+     * cumulative over every request the agentic loop made, so this is the only
+     * usable source for context size.
      */
     iterations?: Array<{
+      /** `message`, or `fallback_message` when an attempt was re-served. */
+      type?: string;
       input_tokens?: number;
       output_tokens?: number;
       cache_read_input_tokens?: number;
@@ -92,11 +95,7 @@ export function* translateEvent(raw: unknown): Generator<AgentEvent> {
         outputTokens: evt.usage.output_tokens,
         cachedInputTokens: evt.usage.cache_read_input_tokens,
         cacheCreationInputTokens: evt.usage.cache_creation_input_tokens,
-        // The CLI reports the window per model it used. Keyed by model id, so
-        // read the largest — a turn that touched only one model has one entry,
-        // and a turn that spilled to a fallback should be sized by the roomier
-        // window rather than whichever key happened to enumerate first.
-        contextWindow: largestContextWindow(evt.modelUsage),
+        contextWindow: soleContextWindow(evt.modelUsage),
         costUsd: evt.total_cost_usd,
       };
     }
@@ -105,23 +104,23 @@ export function* translateEvent(raw: unknown): Generator<AgentEvent> {
 }
 
 /**
- * Largest `contextWindow` across the models the CLI reports for a turn, or
- * `undefined` when it reports none. Tolerant of shape drift: `modelUsage` is a
- * newer field than the rest of `usage`, so anything unexpected yields
- * `undefined` and the footer simply drops the percentage.
+ * The model's context window, but only when it can be attributed unambiguously.
+ *
+ * `modelUsage` is keyed by model id and says nothing about which model produced
+ * the final message, so a turn that touched more than one — a fallback, say —
+ * gives no way to pick the right denominator. Guessing the largest would size
+ * the percentage against a window the answer may never have run in and quietly
+ * under-report it. One entry is unambiguous; anything else drops the
+ * percentage and leaves the token count standing on its own.
  */
-function largestContextWindow(
+function soleContextWindow(
   modelUsage: Record<string, { contextWindow?: number }> | undefined,
 ): number | undefined {
   if (!modelUsage || typeof modelUsage !== 'object') return undefined;
-  let largest: number | undefined;
-  for (const entry of Object.values(modelUsage)) {
-    const w = entry?.contextWindow;
-    if (typeof w === 'number' && Number.isFinite(w) && w > 0 && (largest === undefined || w > largest)) {
-      largest = w;
-    }
-  }
-  return largest;
+  const entries = Object.values(modelUsage);
+  if (entries.length !== 1) return undefined;
+  const w = entries[0]?.contextWindow;
+  return typeof w === 'number' && Number.isFinite(w) && w > 0 ? w : undefined;
 }
 
 /**
@@ -132,11 +131,19 @@ function largestContextWindow(
  * A four-tool-call run measured 160,500 there against a real context of 40,194
  * — four times over, and past the 1M window within a normal session.
  *
- * `usage.iterations` describes the final assistant message (verified against
- * the CLI: its `output_tokens` is that message's alone, not the run's), so its
- * last entry is the last request actually sent. Its three prompt buckets are
- * disjoint, so they add up to that request's whole prompt; plus its output,
- * that is what the next turn starts from.
+ * `usage.iterations` carries one assistant message's own usage, and measurement
+ * puts it at the run's last: with a long closing answer its `output_tokens` was
+ * that message's alone, not the run's, and a run that read two files reported
+ * the post-read prompt rather than the pre-read one. Cross-checked against the
+ * transcript Claude Code writes, whose final assistant message reports the same
+ * figure to the token. Its three prompt buckets are disjoint, so they add up to
+ * that request's whole prompt; plus its output, that is what the next turn
+ * starts from.
+ *
+ * Not proven for fallback, refusal-retry, or compaction turns — none has been
+ * observed carrying more than one iteration. Taking the last entry is right if
+ * they stay in request order (the served attempt is documented to come last),
+ * but that ordering is assumed, not measured.
  *
  * Returns `undefined` when there are no iterations — the totals can't be
  * decomposed, and no footer beats a fourfold-wrong one.
@@ -144,6 +151,7 @@ function largestContextWindow(
 function contextFromIterations(
   iterations:
     | Array<{
+        type?: string;
         input_tokens?: number;
         output_tokens?: number;
         cache_read_input_tokens?: number;
