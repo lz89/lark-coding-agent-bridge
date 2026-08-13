@@ -77,6 +77,10 @@ export interface RunMeta {
   model?: string;
   /** Reasoning effort this run was launched with. */
   effort?: string;
+  /** Which round of a `/goal` continuation this run is, when one is active. */
+  goalRound?: number;
+  /** That goal's round ceiling, so the footer can show progress toward it. */
+  goalMaxRounds?: number;
 }
 
 /** Merge footer fields, keeping already-known values when the new one is absent. */

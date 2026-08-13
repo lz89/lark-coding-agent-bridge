@@ -112,6 +112,24 @@ export function renderFooterMeta(meta: RunMeta | undefined): string | undefined 
     const safe = sanitize(meta.effort, 16);
     if (safe) segments.push(safe);
   }
+  const loop = goalSegment(meta);
+  if (loop) segments.push(loop);
   if (segments.length === 0) return undefined;
   return `🧠 ${segments.join(' · ')}`;
+}
+
+/**
+ * `🔁 7/20` while a continuation loop is running this scope. Each round posts
+ * its own reply, so this is what tells the reader that a new message is round
+ * seven of the same task rather than an answer to something they just asked.
+ */
+function goalSegment(meta: RunMeta): string | undefined {
+  const { goalRound, goalMaxRounds } = meta;
+  if (typeof goalRound !== 'number' || !Number.isInteger(goalRound) || goalRound < 1) {
+    return undefined;
+  }
+  if (typeof goalMaxRounds === 'number' && Number.isInteger(goalMaxRounds) && goalMaxRounds >= goalRound) {
+    return `🔁 ${goalRound}/${goalMaxRounds}`;
+  }
+  return `🔁 ${goalRound}`;
 }

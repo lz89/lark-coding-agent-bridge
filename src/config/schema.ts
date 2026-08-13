@@ -161,6 +161,13 @@ export interface AppPreferences {
   /** Grace between the stall warning and the kill. Default 60 minutes. */
   toolStallGraceMinutes?: number;
   /**
+   * Ceilings for `/goal` continuation runs (see bot/goal.ts). They exist to
+   * bound a goal that stops converging — the agent asking for another round is
+   * never on its own sufficient. Defaults 20 rounds / 8 hours.
+   */
+  goalMaxRounds?: number;
+  goalMaxHours?: number;
+  /**
    * Whether the bot only responds to messages that @-mention it in groups
    * (regular and topic groups). p2p is always unrestricted. Default true:
    * groups are quiet unless the user @bot. Set false to let any group
@@ -329,4 +336,25 @@ export function getToolStallGraceMs(cfg: AppConfig): number {
   if (raw === undefined) return DEFAULT_TOOL_STALL_GRACE_MINUTES * 60_000;
   if (typeof raw !== 'number' || !Number.isFinite(raw) || raw <= 0) return 0;
   return Math.min(Math.max(Math.floor(raw), 1), 240) * 60_000;
+}
+
+export const DEFAULT_GOAL_MAX_ROUNDS = 20;
+export const DEFAULT_GOAL_MAX_HOURS = 8;
+
+/**
+ * Goal ceilings. Unlike the watchdogs these have no "off" — continuation
+ * rounds spend tokens without anyone watching, so an unbounded goal is never a
+ * configuration we offer. `GoalController` clamps again on its own.
+ */
+export function getGoalMaxRounds(cfg: AppConfig): number {
+  return positivePref(cfg.preferences?.goalMaxRounds, DEFAULT_GOAL_MAX_ROUNDS, 200);
+}
+
+export function getGoalMaxHours(cfg: AppConfig): number {
+  return positivePref(cfg.preferences?.goalMaxHours, DEFAULT_GOAL_MAX_HOURS, 72);
+}
+
+function positivePref(raw: unknown, fallback: number, max: number): number {
+  if (typeof raw !== 'number' || !Number.isFinite(raw) || raw < 1) return fallback;
+  return Math.min(Math.floor(raw), max);
 }

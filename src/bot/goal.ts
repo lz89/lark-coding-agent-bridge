@@ -1,0 +1,329 @@
+import { createHash } from 'node:crypto';
+import { mkdir, readFile, rm } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { log } from '../core/logger';
+import { writeFileAtomic } from '../platform/atomic-write';
+
+/**
+ * `/goal` — keep running rounds until the goal is actually closed.
+ *
+ * A headless `claude -p` / `codex exec` run is one-shot: when the turn ends the
+ * process is gone, and anything it promised to do "afterwards" never happens.
+ * A detached `nohup` job survives, but it can only *notify* — it cannot think,
+ * check the result, or decide what to do next.
+ *
+ * This closes that gap on the bridge side: when a round ends, the bridge asks
+ * the agent whether the goal is closed. If not, it starts another round on the
+ * same session, so the agent picks up with full context. The work spans as many
+ * runs as it needs while staying one continuous conversation.
+ *
+ * The signalling protocol is deliberately opt-out rather than opt-in:
+ * **silence ends the loop**. The agent has to actively write a reason to keep
+ * going, so a confused, crashed, or interrupted agent stops — the failure mode
+ * costs one "继续" from the user instead of an unbounded run of API calls.
+ */
+
+/** Hard ceilings, independent of the configured ones — a bug can't outrun these. */
+const ROUND_CEILING = 200;
+const HOURS_CEILING = 72;
+/** Consecutive identical continuation reasons before we call it stuck. */
+const STUCK_REPEATS = 3;
+/** Continuation reasons are echoed into prompts and cards; keep them short. */
+const REASON_MAX_CHARS = 500;
+
+export interface GoalState {
+  scope: string;
+  /** What the user asked for, verbatim — re-stated to the agent every round. */
+  goal: string;
+  /** Rounds already completed. The run in flight is round `round + 1`. */
+  round: number;
+  startedAt: number;
+  deadlineAt: number;
+  maxRounds: number;
+  chatId: string;
+  threadId?: string;
+  /** Why the agent said it wasn't done yet, from the last round. */
+  lastReason?: string;
+  /** How many rounds in a row gave that same reason. */
+  sameReasonStreak: number;
+  /** `interrupted` survives a bridge restart so the user can `/goal resume`. */
+  status: 'active' | 'interrupted';
+}
+
+export type GoalStop = 'done' | 'max-rounds' | 'deadline' | 'stuck' | 'cancelled';
+
+export interface GoalStartInput {
+  scope: string;
+  goal: string;
+  chatId: string;
+  threadId?: string;
+  maxRounds: number;
+  maxHours: number;
+  now: number;
+}
+
+export type GoalAdvance =
+  | { ok: true; state: GoalState }
+  | { ok: false; stop: Exclude<GoalStop, 'done' | 'cancelled'>; state: GoalState };
+
+interface GoalData {
+  entries: Record<string, GoalState>;
+}
+
+export class GoalController {
+  private data: GoalData = { entries: {} };
+  private saving: Promise<void> = Promise.resolve();
+  private readonly path: string | undefined;
+
+  /**
+   * `path` is the profile's goal file. Omitting it makes the controller
+   * memory-only — deliberate rather than defaulting to a shared location: goal
+   * state is per-profile, and a file shared between processes would let a goal
+   * started in one bridge turn up as an interrupted goal in another.
+   */
+  constructor(path?: string) {
+    this.path = path;
+  }
+
+  async load(): Promise<void> {
+    if (!this.path) return;
+    try {
+      const parsed = JSON.parse(await readFile(this.path, 'utf8')) as Partial<GoalData>;
+      this.data = { entries: parsed.entries ?? {} };
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code === 'ENOENT') return;
+      log.warn('goal', 'load-failed', { err: String(err) });
+    }
+  }
+
+  get(scope: string): GoalState | undefined {
+    const state = this.data.entries[scope];
+    return state?.status === 'active' ? state : undefined;
+  }
+
+  /** Includes goals a restart cut short — the ones `/goal resume` can pick up. */
+  getAny(scope: string): GoalState | undefined {
+    return this.data.entries[scope];
+  }
+
+  start(input: GoalStartInput): GoalState {
+    const maxRounds = clamp(input.maxRounds, 1, ROUND_CEILING);
+    const maxHours = clamp(input.maxHours, 1, HOURS_CEILING);
+    const state: GoalState = {
+      scope: input.scope,
+      goal: input.goal,
+      round: 0,
+      startedAt: input.now,
+      deadlineAt: input.now + maxHours * 3_600_000,
+      maxRounds,
+      chatId: input.chatId,
+      ...(input.threadId ? { threadId: input.threadId } : {}),
+      sameReasonStreak: 0,
+      status: 'active',
+    };
+    this.data.entries[input.scope] = state;
+    this.schedulePersist();
+    log.info('goal', 'start', { scope: input.scope, maxRounds, maxHours });
+    return state;
+  }
+
+  /**
+   * The agent asked for another round. Returns whether it gets one — every
+   * limit is checked here so there is exactly one place a goal can be extended.
+   */
+  advance(scope: string, reason: string, now: number): GoalAdvance | undefined {
+    const state = this.get(scope);
+    if (!state) return undefined;
+    const trimmed = reason.trim().slice(0, REASON_MAX_CHARS);
+    const next: GoalState = {
+      ...state,
+      round: state.round + 1,
+      lastReason: trimmed,
+      sameReasonStreak: trimmed && trimmed === state.lastReason ? state.sameReasonStreak + 1 : 0,
+    };
+    this.data.entries[scope] = next;
+    this.schedulePersist();
+
+    if (next.round >= next.maxRounds) return this.stopWith(scope, next, 'max-rounds');
+    if (now >= next.deadlineAt) return this.stopWith(scope, next, 'deadline');
+    // Same reason N rounds running means the agent is restating a blocker it
+    // cannot clear, not making progress toward it.
+    if (next.sameReasonStreak + 1 >= STUCK_REPEATS) return this.stopWith(scope, next, 'stuck');
+    return { ok: true, state: next };
+  }
+
+  private stopWith(
+    scope: string,
+    state: GoalState,
+    stop: Exclude<GoalStop, 'done' | 'cancelled'>,
+  ): GoalAdvance {
+    delete this.data.entries[scope];
+    this.schedulePersist();
+    log.info('goal', 'stop', { scope, stop, round: state.round });
+    return { ok: false, stop, state };
+  }
+
+  /** The agent finished, or the user cancelled. Either way the goal is over. */
+  end(scope: string, stop: Extract<GoalStop, 'done' | 'cancelled'>): GoalState | undefined {
+    const state = this.data.entries[scope];
+    if (!state) return undefined;
+    delete this.data.entries[scope];
+    this.schedulePersist();
+    log.info('goal', 'stop', { scope, stop, round: state.round });
+    return state;
+  }
+
+  /**
+   * Called once at startup: a bridge restart kills every in-flight run, so any
+   * goal still marked active was cut off mid-flight. Park them as `interrupted`
+   * rather than resuming automatically — a restart is usually a deploy, and
+   * silently firing agent runs at boot is not something the user asked for.
+   */
+  markInterrupted(): GoalState[] {
+    const cut: GoalState[] = [];
+    for (const [scope, state] of Object.entries(this.data.entries)) {
+      if (state.status !== 'active') continue;
+      const next: GoalState = { ...state, status: 'interrupted' };
+      this.data.entries[scope] = next;
+      cut.push(next);
+    }
+    if (cut.length > 0) {
+      this.schedulePersist();
+      log.info('goal', 'interrupted-by-restart', { count: cut.length });
+    }
+    return cut;
+  }
+
+  /** Re-arm a goal a restart cut short, keeping its text and round count. */
+  resume(scope: string, now: number, maxHours: number): GoalState | undefined {
+    const state = this.data.entries[scope];
+    if (!state || state.status !== 'interrupted') return undefined;
+    const next: GoalState = {
+      ...state,
+      status: 'active',
+      deadlineAt: now + clamp(maxHours, 1, HOURS_CEILING) * 3_600_000,
+      sameReasonStreak: 0,
+    };
+    this.data.entries[scope] = next;
+    this.schedulePersist();
+    log.info('goal', 'resume', { scope, round: next.round });
+    return next;
+  }
+
+  async flush(): Promise<void> {
+    await this.saving;
+  }
+
+  private schedulePersist(): void {
+    const path = this.path;
+    if (!path) return;
+    this.saving = this.saving
+      .then(async () => {
+        await writeFileAtomic(path, `${JSON.stringify(this.data, null, 2)}\n`, { mode: 0o600 });
+      })
+      .catch((err: unknown) => log.fail('goal', err, { step: 'persist' }));
+  }
+}
+
+function clamp(value: number, min: number, max: number): number {
+  if (!Number.isFinite(value)) return min;
+  return Math.min(Math.max(Math.floor(value), min), max);
+}
+
+/**
+ * Where this round's continuation signal goes.
+ *
+ * One path per (scope, round): a leftover file can never make a *later* round
+ * round, which is the failure mode that would burn tokens unattended. The scope
+ * is hashed because it contains ids and a `:` topic separator.
+ */
+export function goalSignalPath(scope: string, round: number): string {
+  const key = createHash('sha256').update(scope).digest('hex').slice(0, 16);
+  return join(tmpdir(), 'lark-channel-goal', `${key}.${round}.continue`);
+}
+
+/** Read this round's signal and consume it, so it can only ever count once. */
+export async function readGoalSignal(path: string): Promise<string | undefined> {
+  let raw: string;
+  try {
+    raw = await readFile(path, 'utf8');
+  } catch {
+    return undefined;
+  } finally {
+    await rm(path, { force: true }).catch(() => {});
+  }
+  const reason = raw.trim().slice(0, REASON_MAX_CHARS);
+  return reason || undefined;
+}
+
+/** Make sure a stale file from a previous life can't be read as this round's. */
+export async function prepareGoalSignal(path: string): Promise<void> {
+  await mkdir(join(tmpdir(), 'lark-channel-goal'), { recursive: true }).catch(() => {});
+  await rm(path, { force: true }).catch(() => {});
+}
+
+/**
+ * The protocol, restated every round because the path changes every round.
+ *
+ * Deliberately framed around "写文件 = 还没完" rather than a done-marker: the
+ * agent has to take an action to extend it, so every way of failing —
+ * crashing, being interrupted, forgetting — lands on "stop".
+ */
+export function goalProtocolInstruction(input: {
+  goal: string;
+  round: number;
+  maxRounds: number;
+  signalPath: string;
+  deadlineAt: number;
+  now: number;
+}): string {
+  const hoursLeft = Math.max(0, Math.round((input.deadlineAt - input.now) / 360_000) / 10);
+  return [
+    `## 闭环模式(第 ${input.round}/${input.maxRounds} 轮,剩余 ${hoursLeft} 小时)`,
+    '',
+    `总目标:${input.goal}`,
+    '',
+    '你在一个会自动续跑的循环里。本轮结束后,bridge 会检查一个信号文件来决定要不要再给你一轮:',
+    '',
+    '- **目标还没闭环** —— 在本轮结束前把"下一步要做什么"写进这个文件:',
+    '  ```bash',
+    `  echo '<下一步要做什么,一句话>' > ${JSON.stringify(input.signalPath)}`,
+    '  ```',
+    '  bridge 会用同一个 session 再起一轮,你的上下文全部保留。',
+    '- **目标已经闭环** —— 什么都不用做,不要写那个文件。循环结束。',
+    '',
+    '要点:',
+    '',
+    '- 这个文件是**本轮专用**的,路径每轮都变;不要复用、不要提前写。',
+    '- 不确定算不算闭环时,**倾向于停**。用户说一句"继续"就能再开,比空转一晚上便宜。',
+    '- 别为了"续上"而写文件——没有实质进展就直说卡在哪,连续几轮同样的理由会被判定为卡死并终止。',
+    '- 每一轮都要给用户一句人话进度,别只写信号文件。',
+    '- 长任务照常**前台阻塞**着跑;续跑解决的是"一轮装不下",不是"可以 detach 了"。',
+  ].join('\n');
+}
+
+/** The synthetic user turn that opens a continuation round. */
+export function goalContinuationTurn(input: { round: number; goal: string; reason: string }): string {
+  return [
+    `[闭环续跑 · 第 ${input.round} 轮]`,
+    '',
+    `目标:${input.goal}`,
+    `上一轮你写下的下一步:${input.reason}`,
+    '',
+    '接着干。完成了就正常收尾,别再写信号文件。',
+  ].join('\n');
+}
+
+export function goalStopText(stop: GoalStop, state: GoalState): string {
+  const rounds = `共 ${state.round} 轮`;
+  if (stop === 'done') return `✅ 闭环模式结束(${rounds}):agent 判定目标已达成。`;
+  if (stop === 'cancelled') return `⏹ 闭环模式已取消(${rounds})。`;
+  if (stop === 'max-rounds') {
+    return `⏹ 闭环模式已停(${rounds}):达到轮数上限 ${state.maxRounds}。目标未确认完成,用 \`/goal <目标>\` 可以再开一轮。`;
+  }
+  if (stop === 'deadline') {
+    return `⏹ 闭环模式已停(${rounds}):超过时间上限。目标未确认完成。`;
+  }
+  return `⏹ 闭环模式已停(${rounds}):连续 ${STUCK_REPEATS} 轮给出同样的理由「${state.lastReason ?? ''}」,判定为卡住而不是在推进。`;
+}
