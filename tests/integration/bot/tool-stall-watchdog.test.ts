@@ -10,6 +10,10 @@ import type {
   AgentRunOptions,
 } from '../../../src/agent/types.js';
 import { createDefaultProfileConfig } from '../../../src/config/profile-schema.js';
+import {
+  DEFAULT_TOOL_STALL_GRACE_MINUTES,
+  DEFAULT_TOOL_STALL_TIMEOUT_MINUTES,
+} from '../../../src/config/schema.js';
 import { SessionStore } from '../../../src/session/store.js';
 import { WorkspaceStore } from '../../../src/workspace/store.js';
 import { createTmpProfile, type TmpProfile } from '../../helpers/tmp-profile.js';
@@ -31,6 +35,12 @@ import { startChannel } from '../../../src/bot/channel.js';
 
 const MINUTE = 60_000;
 const DEBOUNCE_MS = 600;
+
+// Derived from the shipped defaults rather than restated, so raising them (as
+// 20 + 10 → 60 + 60 did) can't leave these tests asserting a behaviour the
+// bridge no longer has.
+const WARN = DEFAULT_TOOL_STALL_TIMEOUT_MINUTES;
+const GRACE = DEFAULT_TOOL_STALL_GRACE_MINUTES;
 
 interface MessageHandlerMap {
   message?: (msg: NormalizedMessage) => Promise<void> | void;
@@ -64,9 +74,9 @@ describe('tool stall watchdog', () => {
     await h.agent.emit({ type: 'tool_use', id: 't1', name: 'Bash', input: {} });
 
     // Threshold reached: the run is flagged, but deliberately left alone.
-    await vi.advanceTimersByTimeAsync(20 * MINUTE + 100);
+    await vi.advanceTimersByTimeAsync(WARN * MINUTE + 100);
 
-    expect(h.lastCardJson()).toContain('工具 Bash 已 20 分钟无输出');
+    expect(h.lastCardJson()).toContain(`工具 Bash 已 ${WARN} 分钟无输出`);
     expect(h.agent.stopped).toBe(false);
   });
 
@@ -79,10 +89,10 @@ describe('tool stall watchdog', () => {
     await vi.advanceTimersByTimeAsync(DEBOUNCE_MS + 50);
     await h.agent.emit({ type: 'tool_use', id: 't1', name: 'Bash', input: {} });
 
-    await vi.advanceTimersByTimeAsync(20 * MINUTE + 100);
+    await vi.advanceTimersByTimeAsync(WARN * MINUTE + 100);
     expect(h.agent.stopped).toBe(false);
 
-    await vi.advanceTimersByTimeAsync(10 * MINUTE + 100);
+    await vi.advanceTimersByTimeAsync(GRACE * MINUTE + 100);
     expect(h.agent.stopped).toBe(true);
   });
 
@@ -95,7 +105,7 @@ describe('tool stall watchdog', () => {
     await vi.advanceTimersByTimeAsync(DEBOUNCE_MS + 50);
     await h.agent.emit({ type: 'tool_use', id: 't1', name: 'Bash', input: {} });
 
-    await vi.advanceTimersByTimeAsync(20 * MINUTE + 100);
+    await vi.advanceTimersByTimeAsync(WARN * MINUTE + 100);
     expect(h.lastCardJson()).toContain('无输出');
 
     // A legitimately long tool returning must clear the warning outright.
@@ -104,7 +114,7 @@ describe('tool stall watchdog', () => {
     expect(h.lastCardJson()).not.toContain('无输出');
 
     // …and buy the run a full fresh window rather than a partial one.
-    await vi.advanceTimersByTimeAsync(20 * MINUTE - 200);
+    await vi.advanceTimersByTimeAsync(WARN * MINUTE - 200);
     expect(h.agent.stopped).toBe(false);
   });
 
@@ -119,7 +129,7 @@ describe('tool stall watchdog', () => {
     await vi.advanceTimersByTimeAsync(DEBOUNCE_MS + 50);
     await h.agent.emit({ type: 'text', delta: '想一下…' });
 
-    await vi.advanceTimersByTimeAsync(30 * MINUTE + 200);
+    await vi.advanceTimersByTimeAsync((WARN + GRACE) * MINUTE + 200);
     expect(h.agent.stopped).toBe(true);
   });
 

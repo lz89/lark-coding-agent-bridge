@@ -152,11 +152,13 @@ export interface AppPreferences {
    * Two-stage on purpose. At the threshold the card shows the stall and keeps
    * the stop button — a slow-but-legitimate tool is left alone and the user
    * decides. Only after `toolStallGraceMinutes` more silence is the run
-   * stopped. Default 20 + 10, so nothing dies before 30 minutes of true
-   * silence. 0 / negative disables the watchdog entirely.
+   * stopped. Default 60 + 60, so nothing dies before 2 hours of true silence —
+   * chosen to sit at or above the largest sensible `runIdleTimeoutMinutes`, so
+   * this watchdog never becomes the *shorter* of the two and silently caps a
+   * deliberately long idle setting. 0 / negative disables it entirely.
    */
   toolStallTimeoutMinutes?: number;
-  /** Grace between the stall warning and the kill. Default 10 minutes. */
+  /** Grace between the stall warning and the kill. Default 60 minutes. */
   toolStallGraceMinutes?: number;
   /**
    * Whether the bot only responds to messages that @-mention it in groups
@@ -302,8 +304,8 @@ export function getRunIdleTimeoutMs(cfg: AppConfig): number | undefined {
   return clamped * 60_000;
 }
 
-export const DEFAULT_TOOL_STALL_TIMEOUT_MINUTES = 20;
-export const DEFAULT_TOOL_STALL_GRACE_MINUTES = 10;
+export const DEFAULT_TOOL_STALL_TIMEOUT_MINUTES = 60;
+export const DEFAULT_TOOL_STALL_GRACE_MINUTES = 60;
 
 /**
  * Resolve the tool-stall threshold in ms. Unlike the idle watchdog this is

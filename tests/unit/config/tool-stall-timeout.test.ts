@@ -20,9 +20,19 @@ describe('tool stall watchdog config', () => {
     expect(getRunIdleTimeoutMs(cfg())).toBeUndefined();
   });
 
-  it('leaves a full 30 minutes of true silence before anything is killed', () => {
+  it('leaves a full 2 hours of true silence before anything is killed', () => {
     const total = getToolStallTimeoutMs(cfg())! + getToolStallGraceMs(cfg());
-    expect(total).toBe(30 * 60_000);
+    expect(total).toBe(120 * 60_000);
+  });
+
+  it('never fires before the longest idle timeout a user can configure', () => {
+    // The two watchdogs cover different failures, but whichever is *shorter*
+    // is the one that actually kills the run. `runIdleTimeoutMinutes` clamps
+    // at 120, so a stall default below that would silently cap a deliberately
+    // long idle setting — the reason this default is 60 + 60 and not 20 + 10.
+    const stallTotal = getToolStallTimeoutMs(cfg())! + getToolStallGraceMs(cfg());
+    const maxIdle = getRunIdleTimeoutMs(cfg({ runIdleTimeoutMinutes: 99999 }))!;
+    expect(stallTotal).toBeGreaterThanOrEqual(maxIdle);
   });
 
   it('treats an explicit 0 as "disabled", not as "fire immediately"', () => {
