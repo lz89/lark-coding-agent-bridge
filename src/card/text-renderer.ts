@@ -74,3 +74,15 @@ function footerLine(status: 'thinking' | 'tool_running' | 'streaming'): string {
   if (status === 'tool_running') return '_🧰 正在调用工具…_';
   return '_✍️ 正在输出…_';
 }
+
+/**
+ * Does this state have anything to say beyond the run footer?
+ *
+ * The footer is a decoration appended to every terminal state, so it makes
+ * `renderText` non-empty even when the agent produced nothing. Emptiness
+ * checks — "skip the reply", "recall the empty card" — must ignore it, or a
+ * turn with no answer goes out as a message containing only `🧠 …`.
+ */
+export function hasDeliverableContent(state: RunState): boolean {
+  return renderText({ ...state, meta: undefined }).trim() !== '';
+}
