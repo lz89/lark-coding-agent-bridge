@@ -4,7 +4,7 @@ import type { AgentEvent } from '../../../src/agent/types.js';
 import { renderCard } from '../../../src/card/run-renderer.js';
 import { renderFooterMeta } from '../../../src/card/run-footer.js';
 import { finalizeIfRunning, initialState, withMeta, type RunState } from '../../../src/card/run-state.js';
-import { renderText } from '../../../src/card/text-renderer.js';
+import { hasDeliverableContent, renderText } from '../../../src/card/text-renderer.js';
 
 /**
  * A verbatim `result` event from `claude -p --output-format stream-json`,
@@ -136,6 +136,33 @@ describe('footer pipeline', () => {
     );
     expect(JSON.stringify(renderCard(running))).not.toContain('403K');
     expect(renderText(running)).not.toContain('403K');
+  });
+
+  it('does not turn an empty answer into a footer-only message', () => {
+    // Observed in production: a turn whose answer went out as a COT bubble left
+    // the final reply empty, and the footer made the skip-empty guard think
+    // there was something to send — so a message containing nothing but
+    // `🧠 Fable 5 · xhigh` was posted on its own.
+    const empty = withMeta(finalizeIfRunning({ ...initialState, blocks: [] }), {
+      contextTokens: 527_000,
+      model: 'claude-fable-5',
+      effort: 'xhigh',
+    });
+
+    // The footer still renders — it is the emptiness *check* that must ignore it.
+    expect(renderText(empty)).toContain('🧠');
+    expect(hasDeliverableContent(empty)).toBe(false);
+  });
+
+  it('still counts a real answer as deliverable', () => {
+    const answered = withMeta(
+      finalizeIfRunning({
+        ...initialState,
+        blocks: [{ kind: 'text', content: '任务已完成', streaming: false }],
+      }),
+      { contextTokens: 527_000, model: 'claude-fable-5', effort: 'xhigh' },
+    );
+    expect(hasDeliverableContent(answered)).toBe(true);
   });
 
   it('renders the reply unchanged when the CLI reports no usage at all', () => {

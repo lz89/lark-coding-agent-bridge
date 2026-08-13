@@ -38,7 +38,7 @@ import {
   type RunState,
   type StallNotice,
 } from '../card/run-state';
-import { renderText } from '../card/text-renderer';
+import { hasDeliverableContent, renderText } from '../card/text-renderer';
 import { tryHandleCommand, type Controls } from '../commands';
 import type { AppConfig } from '../config/schema';
 import {
@@ -1208,7 +1208,7 @@ async function runAgentBatch(deps: RunBatchDeps): Promise<void> {
           producerStarted: () => producerStarted,
           fallback: async (state) => {
             if (controls.profileConfig.agentKind === 'codex') return;
-            if (renderText(filterForPrefs(state)).trim() === '') return;
+            if (!hasDeliverableContent(filterForPrefs(state))) return;
             await channel.send(
               chatId,
               { card: renderCard(filterForPrefs(state), cardRenderOptions) },
@@ -1288,9 +1288,12 @@ async function runAgentBatch(deps: RunBatchDeps): Promise<void> {
           producerStarted: () => producerStarted,
           fallback: async (state) => {
             if (controls.profileConfig.agentKind === 'codex') return;
-            const body = renderText(filterForPrefs(state));
-            if (body.trim()) {
-              await channel.send(chatId, { markdown: body }, sendOpts);
+            if (hasDeliverableContent(filterForPrefs(state))) {
+              await channel.send(
+                chatId,
+                { markdown: renderText(filterForPrefs(state)) },
+                sendOpts,
+              );
             }
           },
         });
@@ -1484,7 +1487,7 @@ async function recallIfEmptyStreamedReply(
     );
     return;
   }
-  if (renderText(finalState).trim() !== '') return;
+  if (hasDeliverableContent(finalState)) return;
   const result = await progress.settled.catch(() => undefined);
   await recallStreamedMessage(channel, result, scope);
 }
@@ -1520,9 +1523,13 @@ async function sendFinalReply(input: {
   const body = renderText(input.state);
 
   // Nothing deliverable to send (agent produced no text on a clean finish;
-  // error/interrupt/timeout keep `body` non-empty via their notices). Skip
+  // error/interrupt/timeout keep the body non-empty via their notices). Skip
   // rather than post an empty card that renders as "(no content)".
-  if (!body.trim()) {
+  //
+  // Measured without the footer on purpose: it is appended to every terminal
+  // state, so counting it here would turn "nothing to say" into a message
+  // containing only `🧠 403K · Fable 5 · xhigh`.
+  if (!hasDeliverableContent(input.state)) {
     log.info('outbound', 'skip-empty', { scope: input.scope, mode: input.replyMode });
     return;
   }
