@@ -37,6 +37,7 @@ import {
   type Block,
   type RunState,
   type StallNotice,
+  type Terminal,
 } from '../card/run-state';
 import { hasDeliverableContent, renderText } from '../card/text-renderer';
 import { tryHandleCommand, type Controls } from '../commands';
@@ -582,6 +583,11 @@ export async function startChannel(deps: StartChannelDeps): Promise<BridgeChanne
         sessionCatalog?.flush(),
         callbackNonceStore?.flush(),
         workspaces.flush(),
+        // Without this the process can exit between `schedulePersist` and the
+        // atomic write: a goal started just before a restart would come back
+        // unknown, and one just cancelled would come back as a ghost the
+        // restart notice offers to resume.
+        goals.flush(),
       ]);
       if (stopAllResult.status === 'rejected') {
         log.fail('disconnect', stopAllResult.reason, { step: 'stopAll' });
@@ -817,6 +823,7 @@ async function intakeMessage(deps: IntakeDeps): Promise<void> {
   // text rather than launching a run itself, so it goes through the same
   // debounce → batch → run path as anything the user types.
   let queuedTask: string | undefined;
+  let keepPending = false;
   const handled = await tryHandleCommand({
     channel,
     msg: emsg,
@@ -825,6 +832,9 @@ async function intakeMessage(deps: IntakeDeps): Promise<void> {
     goals,
     enqueueTask: (content: string) => {
       queuedTask = content;
+    },
+    keepPending: () => {
+      keepPending = true;
     },
     sessions,
     workspaces,
@@ -844,8 +854,12 @@ async function intakeMessage(deps: IntakeDeps): Promise<void> {
     controls,
   });
   if (handled) {
-    const dropped = pending.cancel(scope);
-    log.info('intake', 'command', { scope, droppedPending: dropped.length });
+    const dropped = keepPending ? [] : pending.cancel(scope);
+    log.info('intake', 'command', {
+      scope,
+      droppedPending: dropped.length,
+      ...(keepPending ? { keptPending: true } : {}),
+    });
     // Pushed after the cancel above, or it would be dropped as stale chatter.
     if (queuedTask !== undefined) pending.push(scope, { ...emsg, content: queuedTask });
     return;
@@ -897,71 +911,100 @@ interface GoalDriveDeps extends Omit<RunBatchDeps, 'goalMode' | 'batch'> {
  * same code path, rather than a second, thinner one that drifts.
  */
 async function driveScopeRun(deps: GoalDriveDeps): Promise<void> {
-  const { goals, pending, controls, channel, scope, mode } = deps;
+  const { goals, pending, channel, scope, mode } = deps;
   const anchor = deps.batch[0];
   if (!anchor) return;
   let batch = deps.batch;
+  // Identity of the goal this driver belongs to, and the round it is running.
+  // Held outside the loop so the catch below can close the right goal.
+  let goalId: string | undefined;
+  let round = 0;
 
-  for (;;) {
-    const state = goals.get(scope);
-    let goalMode: GoalRunContext | undefined;
-    let signalPath: string | undefined;
-    if (state) {
-      const round = state.round + 1;
-      signalPath = goalSignalPath(scope, round);
-      await prepareGoalSignal(signalPath);
-      goalMode = {
-        round,
-        maxRounds: state.maxRounds,
-        instruction: goalProtocolInstruction({
-          goal: state.goal,
+  try {
+    for (;;) {
+      const state = goals.get(scope);
+      let goalMode: GoalRunContext | undefined;
+      let signalPath: string | undefined;
+      if (state) {
+        goalId = state.id;
+        round = state.round + 1;
+        signalPath = goalSignalPath(state.id, round);
+        await prepareGoalSignal(signalPath);
+        goalMode = {
           round,
           maxRounds: state.maxRounds,
-          signalPath,
-          deadlineAt: state.deadlineAt,
-          now: Date.now(),
-        }),
-      };
-    }
+          instruction: goalProtocolInstruction({
+            goal: state.goal,
+            round,
+            maxRounds: state.maxRounds,
+            signalPath,
+            deadlineAt: state.deadlineAt,
+            now: Date.now(),
+          }),
+        };
+      }
 
-    await runAgentBatch({ ...deps, batch, ...(goalMode ? { goalMode } : {}) });
-    if (!state || !signalPath) return;
+      const outcome = await runAgentBatch({ ...deps, batch, ...(goalMode ? { goalMode } : {}) });
+      if (!state || !signalPath) return;
 
-    const reason = await readGoalSignal(signalPath);
-    // Re-read rather than trusting the snapshot: `/stop` and `/goal off` run
-    // during the round, and a loop cancelled mid-round must not get one more.
-    if (!goals.get(scope)) return;
-    if (!reason) {
-      const ended = goals.end(scope, 'done');
-      if (ended) await sendGoalNotice(channel, anchor, mode, goalStopText('done', ended));
-      return;
-    }
+      const reason = await readGoalSignal(signalPath);
+      // A round whose reply path threw never got to decide whether it was done,
+      // and usually never got to write a signal either. Reading that silence as
+      // "goal achieved" would announce success for a round that broke.
+      if (outcome === 'failed') {
+        const failed = goals.end(scope, 'run-failed', { expectId: state.id, roundsRun: round });
+        if (failed) await sendGoalNotice(channel, anchor, mode, goalStopText('run-failed', failed));
+        return;
+      }
+      if (!reason) {
+        // `expectId` guards the window where `/goal off` during this round was
+        // followed by a new goal: without it this round would close that one.
+        const ended = goals.end(scope, 'done', { expectId: state.id, roundsRun: round });
+        if (ended) await sendGoalNotice(channel, anchor, mode, goalStopText('done', ended));
+        return;
+      }
 
-    const advance = goals.advance(scope, reason, Date.now());
-    if (!advance) return;
-    if (!advance.ok) {
-      await sendGoalNotice(channel, anchor, mode, goalStopText(advance.stop, advance.state));
-      return;
-    }
+      const advance = goals.advance(scope, state.id, reason, Date.now());
+      // Gone or replaced — `/stop`, `/goal off`, or a different goal now owns
+      // this scope. Either way this round does not get to extend anything.
+      if (!advance) return;
+      if (!advance.ok) {
+        await sendGoalNotice(channel, anchor, mode, goalStopText(advance.stop, advance.state));
+        return;
+      }
 
-    // Anything the user said mid-round joins the next one instead of waiting
-    // for the whole loop to finish — otherwise a steer sent at round 3 of 20
-    // sits unread for hours.
-    const queued = pending.cancel(scope);
-    if (queued.length > 0) {
-      log.info('goal', 'merged-user-messages', { scope, count: queued.length });
+      // Anything the user said mid-round joins the next one instead of waiting
+      // for the whole goal to finish — otherwise a steer sent at round 3 of 20
+      // sits unread for hours.
+      const queued = pending.cancel(scope);
+      if (queued.length > 0) {
+        log.info('goal', 'merged-user-messages', { scope, count: queued.length });
+      }
+      batch = [
+        continuationMessage(
+          anchor,
+          goalContinuationTurn({
+            round: advance.state.round + 1,
+            goal: advance.state.goal,
+            reason,
+          }),
+        ),
+        ...queued,
+      ];
     }
-    batch = [
-      continuationMessage(
-        anchor,
-        goalContinuationTurn({
-          round: advance.state.round + 1,
-          goal: advance.state.goal,
-          reason,
-        }),
-      ),
-      ...queued,
-    ];
+  } catch (err) {
+    // Whatever threw, it happened outside the reply path's own error handling
+    // (attachment resolution, the run-policy flow, a quote fetch). Leaving the
+    // goal active would strand it: nothing else drives a goal, so `/goal` would
+    // keep reporting "运行中" with no run behind it, and starting a new goal
+    // would be refused.
+    if (goalId) {
+      const failed = goals.end(scope, 'run-failed', { expectId: goalId, roundsRun: round });
+      if (failed) {
+        await sendGoalNotice(channel, anchor, mode, goalStopText('run-failed', failed));
+      }
+    }
+    throw err;
   }
 }
 
@@ -1001,7 +1044,18 @@ async function sendGoalNotice(
   }
 }
 
-async function runAgentBatch(deps: RunBatchDeps): Promise<void> {
+/**
+ * Did the round actually finish its work?
+ *
+ * `failed` covers both ways a round can end without getting there: the reply
+ * path threw, or the run reached a terminal state that is not `done` — an agent
+ * error, a watchdog kill, a user interrupt. Those do not throw (they are
+ * rendered onto the card as events), so a caller checking only for exceptions
+ * would read a crashed round as a finished one.
+ */
+type RoundOutcome = 'completed' | 'failed';
+
+async function runAgentBatch(deps: RunBatchDeps): Promise<RoundOutcome> {
   const {
     channel,
     executor,
@@ -1019,10 +1073,10 @@ async function runAgentBatch(deps: RunBatchDeps): Promise<void> {
     mode,
     goalMode,
   } = deps;
-  if (batch.length === 0) return;
+  if (batch.length === 0) return 'completed';
   const firstMsg = batch[0];
   const lastMsg = batch[batch.length - 1];
-  if (!firstMsg || !lastMsg) return;
+  if (!firstMsg || !lastMsg) return 'completed';
 
   const chatId = firstMsg.chatId;
   const threadId = firstMsg.threadId;
@@ -1192,7 +1246,8 @@ async function runAgentBatch(deps: RunBatchDeps): Promise<void> {
       code: flow.rejectReason.code,
     });
     await channel.send(chatId, { markdown: flow.rejectReason.userVisible }, sendOpts);
-    return;
+    // A rejected run never started; that is a clean outcome, not a broken round.
+    return 'completed';
   }
 
   const { execution, cwdRealpath: cwd } = flow;
@@ -1250,6 +1305,20 @@ async function runAgentBatch(deps: RunBatchDeps): Promise<void> {
   if (toolStallTimeoutMs) {
     log.info('flush', 'tool-stall-watchdog', { toolStallTimeoutMs, toolStallGraceMs });
   }
+
+  // Terminal state of this round's run, recorded wherever the stream resolves.
+  let roundTerminal: Terminal | undefined;
+  const trackTerminal = (state: RunState): RunState => {
+    roundTerminal = state.terminal;
+    return state;
+  };
+  /**
+   * Still `undefined` means the stream never resolved — it rejected, and one of
+   * the reply-path catches handled it (that is where a broken adapter lands,
+   * not in the outer catch). Either way the round did not finish, so anything
+   * other than a clean `done` is a failure.
+   */
+  const outcome = (): RoundOutcome => (roundTerminal === 'done' ? 'completed' : 'failed');
 
   const replyMode = getMessageReplyMode(controls.cfg);
   log.info('flush', 'reply-mode', { mode: replyMode });
@@ -1311,7 +1380,7 @@ async function runAgentBatch(deps: RunBatchDeps): Promise<void> {
         const cotDone = consumeCotEvents(execution.subscribe(), cotPublisher, {
           detail: cotMessages,
         });
-        const finalState = await processAgentStream(
+        const finalState = await (processAgentStream(
           handle,
           eventStream,
           scope,
@@ -1320,7 +1389,7 @@ async function runAgentBatch(deps: RunBatchDeps): Promise<void> {
           async () => {},
           toolStallTimeoutMs,
           toolStallGraceMs,
-        );
+        )).then(trackTerminal);
         await cotDone;
         if (cotPublisher.degradedReason) {
           await sendCotDegradedNotice({
@@ -1343,7 +1412,7 @@ async function runAgentBatch(deps: RunBatchDeps): Promise<void> {
           sendOpts,
           cardRenderOptions,
         });
-        return;
+        return outcome();
       }
       log.warn('cot', 'fallback-existing-reply', { reason: 'create-disabled' });
     }
@@ -1372,7 +1441,7 @@ async function runAgentBatch(deps: RunBatchDeps): Promise<void> {
           sendOpts,
         ),
       );
-      const renderDone = processAgentStream(
+      const renderDone = (processAgentStream(
         handle,
         eventStream,
         scope,
@@ -1387,7 +1456,7 @@ async function runAgentBatch(deps: RunBatchDeps): Promise<void> {
         },
         toolStallTimeoutMs,
         toolStallGraceMs,
-      );
+      )).then(trackTerminal);
       try {
         await awaitRenderAwareStream({
           mode: replyMode,
@@ -1452,7 +1521,7 @@ async function runAgentBatch(deps: RunBatchDeps): Promise<void> {
           sendOpts,
         ),
       );
-      const renderDone = processAgentStream(
+      const renderDone = (processAgentStream(
         handle,
         eventStream,
         scope,
@@ -1467,7 +1536,7 @@ async function runAgentBatch(deps: RunBatchDeps): Promise<void> {
         },
         toolStallTimeoutMs,
         toolStallGraceMs,
-      );
+      )).then(trackTerminal);
       try {
         await awaitRenderAwareStream({
           mode: replyMode,
@@ -1517,7 +1586,7 @@ async function runAgentBatch(deps: RunBatchDeps): Promise<void> {
       // text mode: drain the agent stream without sending anything during
       // the run, then post the final rendered text once as a plain markdown
       // (msg_type=post) message — no card, no streaming, no typewriter.
-      const finalState = await processAgentStream(
+      const finalState = await (processAgentStream(
         handle,
         eventStream,
         scope,
@@ -1526,7 +1595,7 @@ async function runAgentBatch(deps: RunBatchDeps): Promise<void> {
         async () => {},
         toolStallTimeoutMs,
         toolStallGraceMs,
-      );
+      )).then(trackTerminal);
       await sendFinalReply({
         channel,
         chatId,
@@ -1542,10 +1611,15 @@ async function runAgentBatch(deps: RunBatchDeps): Promise<void> {
     }
   } catch (err) {
     log.fail('stream', err);
+    // Swallowed so one broken reply cannot take the bridge down — but reported,
+    // because a caller that treats this as a normal finish (see `driveScopeRun`)
+    // would announce a result the round never reached.
+    return 'failed';
   } finally {
     activePolicyFingerprints.delete(scope);
     scheduleWorkingReactionCleanup(channel, lastMsg.messageId, reactionPromise);
   }
+  return outcome();
 }
 
 interface LazyProgressStream {

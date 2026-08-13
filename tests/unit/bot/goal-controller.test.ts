@@ -27,6 +27,15 @@ afterEach(async () => {
   await rm(dir, { recursive: true, force: true });
 });
 
+/**
+ * `advance` for the goal on `oc_1`, looking its id up first — every caller here
+ * is the current goal asking for another round.
+ */
+function advance(reason: string, now: number, scope = 'oc_1') {
+  const id = controller.getAny(scope)?.id ?? 'no-such-goal';
+  return controller.advance(scope, id, reason, now);
+}
+
 function start(overrides: Partial<Parameters<GoalController['start']>[0]> = {}): GoalState {
   return controller.start({
     scope: 'oc_1',
@@ -42,24 +51,24 @@ function start(overrides: Partial<Parameters<GoalController['start']>[0]> = {}):
 describe('GoalController', () => {
   it('runs another round when the agent asks for one', () => {
     start();
-    const advance = controller.advance('oc_1', '等 make 收尾', T0 + 60_000);
-    expect(advance).toEqual({ ok: true, state: expect.objectContaining({ round: 1 }) });
+    const result = advance('等 make 收尾', T0 + 60_000);
+    expect(result).toEqual({ ok: true, state: expect.objectContaining({ round: 1 }) });
     expect(controller.get('oc_1')?.lastReason).toBe('等 make 收尾');
   });
 
   it('stops at the round ceiling', () => {
     start({ maxRounds: 2 });
-    expect(controller.advance('oc_1', 'a', T0)).toMatchObject({ ok: true });
-    expect(controller.advance('oc_1', 'b', T0)).toMatchObject({ ok: false, stop: 'max-rounds' });
+    expect(advance('a', T0)).toMatchObject({ ok: true });
+    expect(advance('b', T0)).toMatchObject({ ok: false, stop: 'max-rounds' });
     // And the loop is gone, so a late signal can't revive it.
     expect(controller.get('oc_1')).toBeUndefined();
-    expect(controller.advance('oc_1', 'c', T0)).toBeUndefined();
+    expect(advance('c', T0)).toBeUndefined();
   });
 
   it('stops once the deadline passes', () => {
     start({ maxHours: 2 });
-    expect(controller.advance('oc_1', 'a', T0 + HOUR)).toMatchObject({ ok: true });
-    expect(controller.advance('oc_1', 'b', T0 + 2 * HOUR + 1)).toMatchObject({
+    expect(advance('a', T0 + HOUR)).toMatchObject({ ok: true });
+    expect(advance('b', T0 + 2 * HOUR + 1)).toMatchObject({
       ok: false,
       stop: 'deadline',
     });
@@ -69,18 +78,18 @@ describe('GoalController', () => {
     // Distinct from making slow progress: three rounds that all say the same
     // thing are three rounds that produced nothing new to say.
     start();
-    expect(controller.advance('oc_1', '在等编译', T0)).toMatchObject({ ok: true });
-    expect(controller.advance('oc_1', '在等编译', T0)).toMatchObject({ ok: true });
-    expect(controller.advance('oc_1', '在等编译', T0)).toMatchObject({ ok: false, stop: 'stuck' });
+    expect(advance('在等编译', T0)).toMatchObject({ ok: true });
+    expect(advance('在等编译', T0)).toMatchObject({ ok: true });
+    expect(advance('在等编译', T0)).toMatchObject({ ok: false, stop: 'stuck' });
   });
 
   it('treats a changed reason as progress', () => {
     start();
-    controller.advance('oc_1', '在等编译', T0);
-    controller.advance('oc_1', '在等编译', T0);
-    expect(controller.advance('oc_1', '编译完了,开始换二进制', T0)).toMatchObject({ ok: true });
+    advance('在等编译', T0);
+    advance('在等编译', T0);
+    expect(advance('编译完了,开始换二进制', T0)).toMatchObject({ ok: true });
     // The streak resets, so the next repeat starts counting from scratch.
-    expect(controller.advance('oc_1', '换完了,重启链路', T0)).toMatchObject({ ok: true });
+    expect(advance('换完了,重启链路', T0)).toMatchObject({ ok: true });
   });
 
   it('clamps absurd limits instead of trusting them', () => {
@@ -91,7 +100,7 @@ describe('GoalController', () => {
 
   it('survives a restart as an interrupted loop the user can resume', async () => {
     start();
-    controller.advance('oc_1', '等 make 收尾', T0);
+    advance('等 make 收尾', T0);
     await controller.flush();
 
     const reloaded = new GoalController(join(dir, 'goals.json'));
@@ -117,6 +126,44 @@ describe('GoalController', () => {
     expect(controller.resume('unknown-scope', T0, 4)).toBeUndefined();
   });
 
+
+  it('will not let a finished round act on the goal that replaced it', () => {
+    // `/goal off` mid-round leaves the old round still running; a new goal
+    // started right after would otherwise be advanced — or closed — by it.
+    const first = start({ goal: '旧目标' });
+    controller.end('oc_1', 'cancelled');
+    const second = start({ goal: '新目标' });
+    expect(second.id).not.toBe(first.id);
+
+    expect(controller.advance('oc_1', first.id, '旧目标的下一步', T0)).toBeUndefined();
+    expect(controller.end('oc_1', 'done', { expectId: first.id })).toBeUndefined();
+    // The new goal is untouched: still active, still on round 0.
+    expect(controller.get('oc_1')).toMatchObject({ goal: '新目标', round: 0 });
+  });
+
+  it('lets /stop end whatever goal is running, without knowing its id', () => {
+    start();
+    expect(controller.end('oc_1', 'cancelled')).toBeDefined();
+    expect(controller.get('oc_1')).toBeUndefined();
+  });
+
+  it('counts the round that closed the goal', () => {
+    // `round` otherwise only moves when another round is *requested*, so a goal
+    // the agent closed on its first round would report "共 0 轮".
+    start();
+    const ended = controller.end('oc_1', 'done', { roundsRun: 1 });
+    expect(ended?.round).toBe(1);
+    expect(goalStopText('done', ended!)).toContain('共 1 轮');
+  });
+
+  it('reports a broken round as unfinished rather than achieved', () => {
+    start();
+    const failed = controller.end('oc_1', 'run-failed', { roundsRun: 2 });
+    const text = goalStopText('run-failed', failed!);
+    expect(text).toContain('目标未完成');
+    expect(text).not.toContain('已达成');
+  });
+
   it('keeps goals in different scopes independent', () => {
     start({ scope: 'oc_1' });
     start({ scope: 'oc_2:th_1', goal: '另一个目标' });
@@ -135,7 +182,7 @@ describe('GoalController', () => {
 
 describe('loop signal file', () => {
   it('reads the reason once and then forgets it', async () => {
-    const path = goalSignalPath('oc_1', 1);
+    const path = goalSignalPath('goal-a', 1);
     await prepareGoalSignal(path);
     await writeFile(path, '  等 make 收尾\n');
     expect(await readGoalSignal(path)).toBe('等 make 收尾');
@@ -144,28 +191,29 @@ describe('loop signal file', () => {
   });
 
   it('reports no signal when the agent wrote nothing', async () => {
-    const path = goalSignalPath('oc_1', 2);
+    const path = goalSignalPath('goal-a', 2);
     await prepareGoalSignal(path);
     expect(await readGoalSignal(path)).toBeUndefined();
   });
 
   it('treats an empty write as "done", not as a reason to continue', async () => {
-    const path = goalSignalPath('oc_1', 3);
+    const path = goalSignalPath('goal-a', 3);
     await prepareGoalSignal(path);
     await writeFile(path, '   \n\n');
     expect(await readGoalSignal(path)).toBeUndefined();
   });
 
   it('gives every round its own path so a stale file cannot re-trigger', async () => {
-    const first = goalSignalPath('oc_1', 1);
-    expect(goalSignalPath('oc_1', 2)).not.toBe(first);
-    expect(goalSignalPath('oc_2', 1)).not.toBe(first);
-    // Topic scopes carry a `:` that must not reach the filesystem.
-    expect(goalSignalPath('oc_1:th_9', 1)).not.toContain(':');
+    const first = goalSignalPath('goal-a', 1);
+    expect(goalSignalPath('goal-a', 2)).not.toBe(first);
+    expect(goalSignalPath('goal-b', 1)).not.toBe(first);
+    // Two goals in the same scope both start at round 1; keying by goal id is
+    // what stops the second from consuming the first's leftover signal.
+    expect(goalSignalPath('goal-b', 1)).not.toBe(goalSignalPath('goal-a', 1));
   });
 
   it('clears a leftover file before the round starts', async () => {
-    const path = goalSignalPath('oc_1', 4);
+    const path = goalSignalPath('goal-a', 4);
     await prepareGoalSignal(path);
     await writeFile(path, 'stale');
     await prepareGoalSignal(path);
@@ -175,6 +223,7 @@ describe('loop signal file', () => {
 
 describe('goalStopText', () => {
   const state: GoalState = {
+    id: 'goal-1',
     scope: 'oc_1',
     goal: 'g',
     round: 7,
