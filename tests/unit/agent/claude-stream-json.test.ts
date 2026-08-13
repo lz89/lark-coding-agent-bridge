@@ -77,7 +77,19 @@ describe('Claude stream-json translator', () => {
         total_cost_usd: 0.1234,
       }),
     ]).toEqual([
-      { type: 'usage', inputTokens: 12, outputTokens: 34, cachedInputTokens: 5, costUsd: 0.1234 },
+      {
+        type: 'usage',
+        // Claude's `input_tokens` excludes the cache buckets, so context is
+        // 12 + 5 + 0 + 34. Codex reports the same raw numbers but means
+        // something different — see codex-jsonl.test.ts.
+        contextTokens: 51,
+        inputTokens: 12,
+        outputTokens: 34,
+        cachedInputTokens: 5,
+        cacheCreationInputTokens: undefined,
+        contextWindow: undefined,
+        costUsd: 0.1234,
+      },
       { type: 'done', sessionId: 'sess-2', terminationReason: 'normal' },
     ]);
     expect([...translateEvent({ type: 'result', session_id: 'sess-2' })][0]).not.toHaveProperty('threadId');

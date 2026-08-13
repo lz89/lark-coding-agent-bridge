@@ -73,6 +73,26 @@ describe('run executor stop reaper', () => {
     await expect(drained).resolves.toBeInstanceOf(Array);
   });
 
+  it('tears the event source down, not just the subscribers', async () => {
+    // Waking subscribers alone leaves `pump()` parked on `source.next()`,
+    // still holding the run's iterator and the child's stdout — and, if the
+    // child ignored SIGTERM, leaves it running as an orphan.
+    vi.useFakeTimers();
+    const h = harness();
+
+    const execution = await h.executor.submit(submitInput('scope-a'));
+    void drain(execution.subscribe());
+    h.activeRuns.interrupt('scope-a');
+    expect(h.agent.lastRun?.destroyed).toBe(false);
+
+    await vi.advanceTimersByTimeAsync(REAP_MS + 100);
+
+    expect(h.agent.lastRun?.destroyed).toBe(true);
+    // Give the released generator a turn to run its `finally`.
+    await vi.advanceTimersByTimeAsync(10);
+    expect(h.agent.lastRun?.sourceEnded).toBe(true);
+  });
+
   it('does not reap a healthy run that ends on its own', async () => {
     vi.useFakeTimers();
     const h = harness({ events: [{ type: 'done', terminationReason: 'normal' }] });
@@ -129,7 +149,7 @@ function harness(options: { events?: AgentEvent[] } = {}): {
 class StallingAgent implements AgentAdapter {
   readonly id = 'stalling';
   readonly displayName = 'Stalling Agent';
-  lastRun: { stopped: boolean } | undefined;
+  lastRun: { stopped: boolean; destroyed: boolean; sourceEnded: boolean } | undefined;
   #events: AgentEvent[];
 
   constructor(events: AgentEvent[]) {
@@ -144,20 +164,33 @@ class StallingAgent implements AgentAdapter {
 
   run(opts: AgentRunOptions): AgentRun {
     const events = [...this.#events];
-    const state = { stopped: false };
+    const state = { stopped: false, destroyed: false, sourceEnded: false };
     this.lastRun = state;
     const ends = events.some((e) => e.type === 'done' || e.type === 'error');
+    // Resolves only when `destroy()` tears the source down — the stand-in for
+    // a child that ignored SIGTERM and left stdout held open by a descendant.
+    let releaseSource: (() => void) | undefined;
     return {
       runId: opts.runId,
       events: (async function* (): AsyncGenerator<AgentEvent> {
-        for (const evt of events) yield evt;
-        if (ends) return;
-        await new Promise<void>(() => {
-          /* never settles — a wedged child holding the pipe open */
-        });
+        try {
+          for (const evt of events) yield evt;
+          if (ends) return;
+          await new Promise<void>((resolve) => {
+            releaseSource = resolve;
+          });
+        } finally {
+          state.sourceEnded = true;
+        }
       })(),
       async stop() {
+        // Deliberately does NOT end the stream: `stop()` being insufficient is
+        // the whole scenario the reaper exists for.
         state.stopped = true;
+      },
+      destroy() {
+        state.destroyed = true;
+        releaseSource?.();
       },
       async waitForExit() {
         return ends;

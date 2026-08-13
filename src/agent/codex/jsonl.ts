@@ -160,8 +160,15 @@ export class CodexJsonlTranslator {
     }
     const usage = recordValue(raw.usage);
     if (usage) {
+      const inputTokens = numberValue(usage.input_tokens ?? usage.inputTokens);
+      const outputTokens = numberValue(usage.output_tokens ?? usage.outputTokens);
+      // Codex/OpenAI report `input_tokens` as the *whole* prompt, with
+      // `cached_input_tokens` being the part of it that was cached — adding
+      // the two would count the cached span twice.
+      const contextTokens = (inputTokens ?? 0) + (outputTokens ?? 0);
       events.push({
         type: 'usage',
+        contextTokens: contextTokens > 0 ? contextTokens : undefined,
         inputTokens: numberValue(usage.input_tokens ?? usage.inputTokens),
         outputTokens: numberValue(usage.output_tokens ?? usage.outputTokens),
         cachedInputTokens: numberValue(usage.cached_input_tokens ?? usage.cachedInputTokens),

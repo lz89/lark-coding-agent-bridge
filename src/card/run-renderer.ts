@@ -237,7 +237,9 @@ function stallText(stalled: StallNotice | undefined): string {
 function summaryText(state: RunState): string {
   if (state.terminal === 'interrupted') return '已中断';
   if (state.terminal === 'idle_timeout') return '已超时';
-  if (state.terminal === 'stall_timeout') return '工具卡死';
+  // Only blame a tool when one was actually outstanding — the same watchdog
+  // also bounds a run that went silent without ever calling one.
+  if (state.terminal === 'stall_timeout') return state.stalled?.tool ? '工具卡死' : '无响应';
   if (state.stalled) return '疑似卡住';
   if (state.terminal === 'error') return '出错';
   if (state.terminal === 'done') return '已完成';

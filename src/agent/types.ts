@@ -17,6 +17,14 @@ export type AgentEvent =
       cachedInputTokens?: number;
       /** `cache_creation_input_tokens` — part of the prompt, so part of context. */
       cacheCreationInputTokens?: number;
+      /**
+       * Tokens that will be in context on the next turn. Computed by the
+       * adapter, because the arithmetic is provider-specific: Claude reports
+       * cached prompt tokens in buckets *separate* from `input_tokens`, while
+       * Codex/OpenAI report an `input_tokens` that already includes them.
+       * Summing the raw fields generically double-counts on one of the two.
+       */
+      contextTokens?: number;
       /** Model's context window, reported by the CLI. Used for the % on the footer. */
       contextWindow?: number;
       reasoningOutputTokens?: number;
@@ -70,6 +78,14 @@ export interface AgentRun {
    * 143 instead of 0; waiting it out lets it exit cleanly.
    */
   waitForExit(timeoutMs: number): Promise<boolean>;
+  /**
+   * Last-resort teardown: SIGKILL the process and destroy its pipes so the
+   * event iterator ends. `stop()` is the graceful path and normally suffices;
+   * this exists for the case where it didn't — a child that ignored SIGTERM,
+   * or a descendant still holding stdout open — and the caller has given up
+   * waiting. Optional: adapters that own no OS resources can omit it.
+   */
+  destroy?(): void;
 }
 
 /**
