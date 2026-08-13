@@ -1,4 +1,5 @@
 import { deepMaskEmails } from './mask-email';
+import { renderFooterMeta } from './run-footer';
 import type { Block, FooterStatus, RunState, StallNotice, ToolEntry } from './run-state';
 import { toolBodyMd, toolHeaderText } from './tool-render';
 
@@ -47,6 +48,18 @@ export function renderCard(state: RunState, options: RunCardRenderOptions = {}):
     elements.push(noteMd(`⚠️ agent 失败：${state.errorMsg}`));
   } else if (state.terminal === 'done' && elements.length === 0) {
     elements.push(noteMd('_（未返回内容）_'));
+  }
+
+  // The run footer sits below everything, behind a divider — a finished
+  // reply's receipt. Never shown mid-run: the usage that feeds it only
+  // arrives with the terminal event, so a running card would show a stale
+  // count from the previous turn.
+  if (state.terminal !== 'running') {
+    const footer = renderFooterMeta(state.meta);
+    if (footer) {
+      elements.push({ tag: 'hr' });
+      elements.push(noteMd(footer));
+    }
   }
 
   if (state.terminal === 'running') {

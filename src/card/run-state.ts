@@ -53,6 +53,39 @@ export interface RunState {
    * merely slow leaves no trace once it reports back.
    */
   stalled?: StallNotice;
+  /** What the run footer reports. See {@link RunMeta}. */
+  meta?: RunMeta;
+}
+
+/**
+ * The "🧠 403K · Fable 5 · max" line under a finished reply.
+ *
+ * Every field is independently optional and the footer degrades field by
+ * field — it is a decoration, and no part of it is worth failing a reply over.
+ */
+export interface RunMeta {
+  /**
+   * Tokens that will be in context on the next turn: this turn's whole prompt
+   * (fresh + both cache tiers) plus what the model wrote. Deliberately not
+   * "tokens billed this turn", which is far smaller once the cache is warm and
+   * would read as though the conversation had barely grown.
+   */
+  contextTokens?: number;
+  /** The model's context window, when the CLI reported one. */
+  contextWindow?: number;
+  /** Model id as *actually* run, reported by the CLI — not what was requested. */
+  model?: string;
+  /** Reasoning effort this run was launched with. */
+  effort?: string;
+}
+
+/** Merge footer fields, keeping already-known values when the new one is absent. */
+export function withMeta(state: RunState, patch: RunMeta): RunState {
+  const merged: RunMeta = { ...state.meta };
+  for (const [key, value] of Object.entries(patch)) {
+    if (value !== undefined) (merged as Record<string, unknown>)[key] = value;
+  }
+  return { ...state, meta: merged };
 }
 
 export const initialState: RunState = {

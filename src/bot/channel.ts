@@ -6,7 +6,12 @@ import type {
 import { createLarkChannel } from '@larksuite/channel';
 import { dirname, join } from 'node:path';
 import { claudeCapability, codexCapability } from '../agent/capability';
-import { modelLabel, normalizeModelSelection, resolveModelArg } from '../agent/models';
+import {
+  modelLabel,
+  normalizeModelSelection,
+  resolveEffortArg,
+  resolveModelArg,
+} from '../agent/models';
 import {
   buildAgentPrompt,
   type BridgePromptInteractiveCard,
@@ -28,6 +33,7 @@ import {
   markStallTimeout,
   markStalled,
   reduce,
+  withMeta,
   type Block,
   type RunState,
   type StallNotice,
@@ -1068,9 +1074,13 @@ async function runAgentBatch(deps: RunBatchDeps): Promise<void> {
 
   // Re-read prefs on every flush so toggling /config mid-stream takes
   // effect immediately. Cheap object lookups, no allocation when on.
+  const runEffort = resolveEffortArg(agentKind, controls.profileConfig.preferences.effort);
   const filterForPrefs = (state: RunState): RunState => {
-    if (getShowToolCalls(controls.cfg)) return state;
-    return { ...state, blocks: state.blocks.filter((b) => b.kind !== 'tool') };
+    // Effort never arrives as an agent event — it's what we launched with, so
+    // it's stamped on at render time rather than tracked through the stream.
+    const withEffort = runEffort ? withMeta(state, { effort: runEffort }) : state;
+    if (getShowToolCalls(controls.cfg)) return withEffort;
+    return { ...withEffort, blocks: withEffort.blocks.filter((b) => b.kind !== 'tool') };
   };
   const cardRenderOptions = callbackAuth
     ? {
@@ -1753,6 +1763,9 @@ async function processAgentStream(
 
       if (evt.type === 'system') {
         recordSession(evt);
+        // Ground truth for the footer: what the CLI actually loaded, which can
+        // differ from what was requested (unknown id, account fallback).
+        if (evt.model) state = withMeta(state, { model: evt.model });
         continue;
       }
       if (evt.type === 'usage') {
@@ -1767,6 +1780,19 @@ async function processAgentStream(
           if (inputTokens !== undefined) reportMetric('tokens_in', inputTokens);
           if (outputTokens !== undefined) reportMetric('tokens_out', outputTokens);
         }
+        // Context going into the next turn = this turn's whole prompt (fresh +
+        // both cache tiers) plus what the model wrote. Billed tokens alone
+        // would read as though the conversation had barely grown once the
+        // cache is warm.
+        const contextTokens =
+          (evt.inputTokens ?? 0) +
+          (evt.cachedInputTokens ?? 0) +
+          (evt.cacheCreationInputTokens ?? 0) +
+          (evt.outputTokens ?? 0);
+        state = withMeta(state, {
+          contextTokens: contextTokens > 0 ? contextTokens : undefined,
+          contextWindow: evt.contextWindow,
+        });
         continue;
       }
 
