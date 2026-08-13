@@ -24,6 +24,17 @@ interface ClaudeRawEvent {
     output_tokens?: number;
     cache_read_input_tokens?: number;
     cache_creation_input_tokens?: number;
+    /**
+     * Per-request breakdown for the run's **final** assistant message. The
+     * sibling totals are cumulative over every request the agentic loop made,
+     * so they are the only usable source for context size.
+     */
+    iterations?: Array<{
+      input_tokens?: number;
+      output_tokens?: number;
+      cache_read_input_tokens?: number;
+      cache_creation_input_tokens?: number;
+    }>;
   };
   modelUsage?: Record<string, { contextWindow?: number }>;
   total_cost_usd?: number;
@@ -74,17 +85,9 @@ export function* translateEvent(raw: unknown): Generator<AgentEvent> {
 
   if (evt.type === 'result') {
     if (evt.usage) {
-      const u = evt.usage;
-      // Claude's `input_tokens` counts only the uncached remainder, so the
-      // whole prompt is the three buckets added together.
-      const contextTokens =
-        (u.input_tokens ?? 0) +
-        (u.cache_read_input_tokens ?? 0) +
-        (u.cache_creation_input_tokens ?? 0) +
-        (u.output_tokens ?? 0);
       yield {
         type: 'usage',
-        contextTokens: contextTokens > 0 ? contextTokens : undefined,
+        contextTokens: contextFromIterations(evt.usage.iterations),
         inputTokens: evt.usage.input_tokens,
         outputTokens: evt.usage.output_tokens,
         cachedInputTokens: evt.usage.cache_read_input_tokens,
@@ -119,4 +122,42 @@ function largestContextWindow(
     }
   }
   return largest;
+}
+
+/**
+ * Context size going into the next turn, from the run's final request.
+ *
+ * The top-level `usage` totals cannot be used for this: one `claude -p` run
+ * drives a whole agentic loop, and those fields sum **every** request it made.
+ * A four-tool-call run measured 160,500 there against a real context of 40,194
+ * — four times over, and past the 1M window within a normal session.
+ *
+ * `usage.iterations` describes the final assistant message (verified against
+ * the CLI: its `output_tokens` is that message's alone, not the run's), so its
+ * last entry is the last request actually sent. Its three prompt buckets are
+ * disjoint, so they add up to that request's whole prompt; plus its output,
+ * that is what the next turn starts from.
+ *
+ * Returns `undefined` when there are no iterations — the totals can't be
+ * decomposed, and no footer beats a fourfold-wrong one.
+ */
+function contextFromIterations(
+  iterations:
+    | Array<{
+        input_tokens?: number;
+        output_tokens?: number;
+        cache_read_input_tokens?: number;
+        cache_creation_input_tokens?: number;
+      }>
+    | undefined,
+): number | undefined {
+  if (!Array.isArray(iterations) || iterations.length === 0) return undefined;
+  const last = iterations[iterations.length - 1];
+  if (!last || typeof last !== 'object') return undefined;
+  const total =
+    (last.input_tokens ?? 0) +
+    (last.cache_read_input_tokens ?? 0) +
+    (last.cache_creation_input_tokens ?? 0) +
+    (last.output_tokens ?? 0);
+  return total > 0 ? total : undefined;
 }
