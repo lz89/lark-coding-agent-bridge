@@ -178,6 +178,22 @@ describe('goal continuation', () => {
     expect(last).not.toContain('已达成');
   });
 
+  it('does not continue on a round that signalled early and then died', async () => {
+    // Agents write the signal partway through a round. One killed afterwards —
+    // by the stall watchdog, an adapter error, a crash — leaves behind a plan
+    // it never carried out; running the next round on top of it would build on
+    // a round that broke.
+    const h = await createHarness(['先起构建', '等 make 收尾', undefined]);
+    h.agent.errorAfterSignalRounds.add(1);
+    await startTestBridge(h);
+
+    await h.send('/goal 目标');
+    await h.settleAt(1);
+
+    expect(h.agent.prompts).toHaveLength(1);
+    expect(h.texts().at(-1)).toContain('目标未完成');
+  });
+
   it('keeps going when the round finished but its reply failed to send', async () => {
     // The agent reached the end and asked for another round; only delivery
     // broke. Ending the goal there would let one Feishu blip kill hours of
@@ -236,6 +252,8 @@ class ScriptedAgent implements AgentAdapter {
 
   /** Rounds listed here throw instead of producing events. */
   failRounds = new Set<number>();
+  /** Rounds that write their signal and *then* die. */
+  errorAfterSignalRounds = new Set<number>();
 
   constructor(private readonly script: Array<string | undefined>) {}
 
@@ -252,6 +270,7 @@ class ScriptedAgent implements AgentAdapter {
     const round = ++this.#round;
     const reason = this.script[round - 1];
     const shouldFail = this.failRounds.has(round);
+    const dieAfterSignal = this.errorAfterSignalRounds.has(round);
     // Read the path out of the prompt, exactly as a real agent has to — which
     // also means a round whose prompt carries no path cannot signal at all.
     // Every prompt section is JSON-encoded (see `promptSection`), so the path
@@ -263,8 +282,9 @@ class ScriptedAgent implements AgentAdapter {
         await writeFile(signalPath, reason, 'utf8');
       }
       // A round that finished instantly would leave no window for the tests
-      // that act *during* one (/stop, a mid-loop steer) to land inside it.
+      // that act *during* one (/stop, a mid-goal steer) to land inside it.
       await new Promise((resolve) => setTimeout(resolve, ROUND_HOLD_MS));
+      if (dieAfterSignal) throw new Error('tool wedged after the signal was written');
       yield { type: 'text', delta: `第 ${round} 轮进度。` };
     })();
     return {

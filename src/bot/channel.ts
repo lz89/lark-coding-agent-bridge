@@ -538,6 +538,12 @@ export async function startChannel(deps: StartChannelDeps): Promise<BridgeChanne
   // mid-goal. Tell its chat rather than resuming silently: restarts are
   // usually deploys, and firing agent runs at boot is not something the user
   // asked for at that moment.
+  // Signals whose round died with a previous process would otherwise sit in the
+  // profile forever once their goal is replaced rather than resumed.
+  void goals
+    .sweepSignals(Date.now())
+    .catch((err) => log.warn('goal', 'signal-sweep-failed', { err: String(err) }));
+
   for (const cut of goals.markInterrupted()) {
     void channel
       .send(cut.chatId, {
@@ -954,12 +960,12 @@ async function driveScopeRun(deps: GoalDriveDeps): Promise<void> {
         return ended ? sendGoalNotice(channel, anchor, mode, goalStopText(stop, ended)) : undefined;
       };
 
-      // A round whose run did not reach a clean end never got to decide whether
-      // it was done, and usually never got to write a signal either. Reading
-      // that silence as "goal achieved" would announce success for a round that
-      // broke. A round that *did* signal is believed regardless: the agent
-      // finished its work, and only delivery failed after that.
-      if (outcome === 'failed' && signal.kind !== 'continue') {
+      // A run that did not reach `done` decides nothing — not "achieved", and
+      // not "continue" either. Agents write the signal partway through a round,
+      // so one killed by the stall watchdog or felled by an adapter error can
+      // leave a `continue` behind that describes a plan it never carried out.
+      // Believing it would run the next round on top of a broken one.
+      if (outcome === 'run-failed') {
         await endRound('run-failed');
         return;
       }
@@ -1058,15 +1064,20 @@ async function sendGoalNotice(
 }
 
 /**
- * Did the round actually finish its work?
+ * How a round ended, from the perspective of whether its work got done.
  *
- * `failed` covers both ways a round can end without getting there: the reply
- * path threw, or the run reached a terminal state that is not `done` — an agent
- * error, a watchdog kill, a user interrupt. Those do not throw (they are
- * rendered onto the card as events), so a caller checking only for exceptions
- * would read a crashed round as a finished one.
+ * The distinction that matters is *when* things broke. A run that never
+ * reached `done` — an agent error, a watchdog kill, an interrupt, a rejected
+ * flow — did not finish its work, and anything it left behind (including a
+ * continuation signal written early in the round) says nothing about where it
+ * actually got to. A run that reached `done` and then failed to deliver its
+ * reply did finish; only the message was lost.
+ *
+ * Collapsing the two is wrong in both directions: treating delivery failure as
+ * a dead round ends goals over one Feishu blip, and treating a killed run as a
+ * finished one continues a goal on a round that died mid-tool.
  */
-type RoundOutcome = 'completed' | 'failed';
+type RoundOutcome = 'completed' | 'delivery-failed' | 'run-failed';
 
 async function runAgentBatch(deps: RunBatchDeps): Promise<RoundOutcome> {
   const {
@@ -1263,7 +1274,7 @@ async function runAgentBatch(deps: RunBatchDeps): Promise<RoundOutcome> {
     // The reason went to the user already, but for a goal this is emphatically
     // not "round finished": calling it completed would close the goal as
     // achieved on a round that never ran.
-    return 'failed';
+    return 'run-failed';
   }
 
   const { execution, cwdRealpath: cwd } = flow;
@@ -1331,10 +1342,10 @@ async function runAgentBatch(deps: RunBatchDeps): Promise<RoundOutcome> {
   /**
    * Still `undefined` means the stream never resolved — it rejected, and one of
    * the reply-path catches handled it (that is where a broken adapter lands,
-   * not in the outer catch). Either way the round did not finish, so anything
-   * other than a clean `done` is a failure.
+   * not in the outer catch). Either way the run did not reach `done`.
    */
-  const outcome = (): RoundOutcome => (roundTerminal === 'done' ? 'completed' : 'failed');
+  const runReachedDone = (): boolean => roundTerminal === 'done';
+  const outcome = (): RoundOutcome => (runReachedDone() ? 'completed' : 'run-failed');
 
   const replyMode = getMessageReplyMode(controls.cfg);
   log.info('flush', 'reply-mode', { mode: replyMode });
@@ -1627,11 +1638,10 @@ async function runAgentBatch(deps: RunBatchDeps): Promise<RoundOutcome> {
     }
   } catch (err) {
     log.fail('stream', err);
-    // Swallowed so one broken reply cannot take the bridge down. The outcome
-    // still comes from the run's own terminal state: a send that failed *after*
-    // the agent finished is a delivery problem, and reporting it as a round
-    // that never ran would end a goal the agent had just asked to continue.
-    return outcome();
+    // Swallowed so one broken reply cannot take the bridge down. Which failure
+    // this was still comes from the run's own terminal state: reaching `done`
+    // first means the agent finished and only the message was lost.
+    return runReachedDone() ? 'delivery-failed' : 'run-failed';
   } finally {
     activePolicyFingerprints.delete(scope);
     scheduleWorkingReactionCleanup(channel, lastMsg.messageId, reactionPromise);
