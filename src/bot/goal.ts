@@ -1,4 +1,4 @@
-import { createHash } from 'node:crypto';
+import { randomUUID } from 'node:crypto';
 import { mkdir, readFile, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -33,6 +33,12 @@ const STUCK_REPEATS = 3;
 const REASON_MAX_CHARS = 500;
 
 export interface GoalState {
+  /**
+   * Identifies this goal, not this scope. A round that finishes after its goal
+   * was cancelled must not be able to act on whatever goal replaced it, and
+   * scope alone cannot tell the two apart.
+   */
+  id: string;
   scope: string;
   /** What the user asked for, verbatim — re-stated to the agent every round. */
   goal: string;
@@ -51,7 +57,13 @@ export interface GoalState {
   status: 'active' | 'interrupted';
 }
 
-export type GoalStop = 'done' | 'max-rounds' | 'deadline' | 'stuck' | 'cancelled';
+export type GoalStop =
+  | 'done'
+  | 'max-rounds'
+  | 'deadline'
+  | 'stuck'
+  | 'cancelled'
+  | 'run-failed';
 
 export interface GoalStartInput {
   scope: string;
@@ -63,9 +75,11 @@ export interface GoalStartInput {
   now: number;
 }
 
+type StopByLimit = Extract<GoalStop, 'max-rounds' | 'deadline' | 'stuck'>;
+
 export type GoalAdvance =
   | { ok: true; state: GoalState }
-  | { ok: false; stop: Exclude<GoalStop, 'done' | 'cancelled'>; state: GoalState };
+  | { ok: false; stop: StopByLimit; state: GoalState };
 
 interface GoalData {
   entries: Record<string, GoalState>;
@@ -111,6 +125,7 @@ export class GoalController {
     const maxRounds = clamp(input.maxRounds, 1, ROUND_CEILING);
     const maxHours = clamp(input.maxHours, 1, HOURS_CEILING);
     const state: GoalState = {
+      id: randomUUID(),
       scope: input.scope,
       goal: input.goal,
       round: 0,
@@ -132,9 +147,9 @@ export class GoalController {
    * The agent asked for another round. Returns whether it gets one — every
    * limit is checked here so there is exactly one place a goal can be extended.
    */
-  advance(scope: string, reason: string, now: number): GoalAdvance | undefined {
+  advance(scope: string, id: string, reason: string, now: number): GoalAdvance | undefined {
     const state = this.get(scope);
-    if (!state) return undefined;
+    if (!state || state.id !== id) return undefined;
     const trimmed = reason.trim().slice(0, REASON_MAX_CHARS);
     const next: GoalState = {
       ...state,
@@ -153,25 +168,38 @@ export class GoalController {
     return { ok: true, state: next };
   }
 
-  private stopWith(
-    scope: string,
-    state: GoalState,
-    stop: Exclude<GoalStop, 'done' | 'cancelled'>,
-  ): GoalAdvance {
+  private stopWith(scope: string, state: GoalState, stop: StopByLimit): GoalAdvance {
     delete this.data.entries[scope];
     this.schedulePersist();
     log.info('goal', 'stop', { scope, stop, round: state.round });
     return { ok: false, stop, state };
   }
 
-  /** The agent finished, or the user cancelled. Either way the goal is over. */
-  end(scope: string, stop: Extract<GoalStop, 'done' | 'cancelled'>): GoalState | undefined {
+  /**
+   * The agent finished, the round failed, or the user cancelled.
+   *
+   * `expectId` is how a finishing round proves it is still the current goal —
+   * without it a round that outlived a `/goal off` would close whatever goal
+   * was started next. `/stop` passes none: it ends whatever is running.
+   *
+   * `roundsRun` records the round that just finished. `round` otherwise only
+   * advances when another round is *requested*, so a goal closed on its first
+   * round would report "共 0 轮".
+   */
+  end(
+    scope: string,
+    stop: Extract<GoalStop, 'done' | 'cancelled' | 'run-failed'>,
+    opts: { expectId?: string; roundsRun?: number } = {},
+  ): GoalState | undefined {
     const state = this.data.entries[scope];
     if (!state) return undefined;
+    if (opts.expectId !== undefined && state.id !== opts.expectId) return undefined;
     delete this.data.entries[scope];
+    const ended =
+      opts.roundsRun !== undefined ? { ...state, round: opts.roundsRun } : state;
     this.schedulePersist();
-    log.info('goal', 'stop', { scope, stop, round: state.round });
-    return state;
+    log.info('goal', 'stop', { scope, stop, round: ended.round });
+    return ended;
   }
 
   /**
@@ -234,13 +262,14 @@ function clamp(value: number, min: number, max: number): number {
 /**
  * Where this round's continuation signal goes.
  *
- * One path per (scope, round): a leftover file can never make a *later* round
- * round, which is the failure mode that would burn tokens unattended. The scope
- * is hashed because it contains ids and a `:` topic separator.
+ * Keyed by goal id rather than by scope: two bots can share a chat, and one
+ * scope can run goals back to back whose round numbers both start at 1 — either
+ * would collide on a scope-keyed path, letting one goal consume or delete
+ * another's signal. One path per (goal, round) also means a leftover file can
+ * never drive a later round, which is the failure that burns tokens unattended.
  */
-export function goalSignalPath(scope: string, round: number): string {
-  const key = createHash('sha256').update(scope).digest('hex').slice(0, 16);
-  return join(tmpdir(), 'lark-channel-goal', `${key}.${round}.continue`);
+export function goalSignalPath(goalId: string, round: number): string {
+  return join(tmpdir(), 'lark-channel-goal', `${goalId}.${round}.continue`);
 }
 
 /** Read this round's signal and consume it, so it can only ever count once. */
@@ -319,6 +348,12 @@ export function goalStopText(stop: GoalStop, state: GoalState): string {
   const rounds = `共 ${state.round} 轮`;
   if (stop === 'done') return `✅ 闭环模式结束(${rounds}):agent 判定目标已达成。`;
   if (stop === 'cancelled') return `⏹ 闭环模式已取消(${rounds})。`;
+  if (stop === 'run-failed') {
+    return (
+      `⚠️ 闭环模式已停(${rounds}):本轮运行出错,没跑完。**目标未完成** —— ` +
+      '这不是 agent 说它做好了,是这一轮断了。看日志查原因,确认后用 `/goal <目标>` 重开。'
+    );
+  }
   if (stop === 'max-rounds') {
     return `⏹ 闭环模式已停(${rounds}):达到轮数上限 ${state.maxRounds}。目标未确认完成,用 \`/goal <目标>\` 可以再开一轮。`;
   }

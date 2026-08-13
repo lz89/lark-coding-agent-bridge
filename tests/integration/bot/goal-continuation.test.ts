@@ -14,7 +14,7 @@ import { createDefaultProfileConfig } from '../../../src/config/profile-schema.j
 import { SessionStore } from '../../../src/session/store.js';
 import { WorkspaceStore } from '../../../src/workspace/store.js';
 import { createTmpProfile, type TmpProfile } from '../../helpers/tmp-profile.js';
-import { goalSignalPath, prepareGoalSignal } from '../../../src/bot/goal.js';
+
 
 const sdkMock = vi.hoisted(() => ({
   channel: undefined as FakeLarkChannel | undefined,
@@ -58,7 +58,7 @@ afterEach(async () => {
  * `GoalController` is that a round has to be a *real* run through the whole
  * batch path: same session, same card routing, same watchdogs.
  */
-describe('loop continuation', () => {
+describe('goal continuation', () => {
   it('keeps running rounds until the agent stops asking for another', async () => {
     // Rounds 1 and 2 leave a continuation reason; round 3 doesn't.
     const h = await createHarness(['先起构建', '等 make 收尾', undefined]);
@@ -98,7 +98,7 @@ describe('loop continuation', () => {
     await h.send('/goal 目标');
     await h.settleAt(2);
 
-    const paths = h.agent.prompts.map((p) => /(\/[^\s"]*\.continue)/.exec(p)?.[1]);
+    const paths = h.agent.prompts.map((p) => /([^\s"\\]+\.continue)/.exec(p)?.[1]);
     expect(paths[0]).toBeTruthy();
     expect(paths[1]).toBeTruthy();
     // Reusing round 1's path would mean round 2's "done" reads as round 1's
@@ -131,7 +131,7 @@ describe('loop continuation', () => {
     expect(h.texts().at(-1)).toContain('卡住');
   });
 
-  it('/stop ends the loop even after the round wrote its signal', async () => {
+  it('/stop ends the goal even after the round wrote its signal', async () => {
     const h = await createHarness(['继续', '继续', undefined]);
     await startTestBridge(h);
 
@@ -146,7 +146,7 @@ describe('loop continuation', () => {
     expect(h.texts().some((t) => t.includes('取消'))).toBe(true);
   });
 
-  it('folds a message sent mid-loop into the next round', async () => {
+  it('folds a message sent mid-goal into the next round', async () => {
     const h = await createHarness(['继续', undefined]);
     await startTestBridge(h);
 
@@ -156,11 +156,44 @@ describe('loop continuation', () => {
     await h.settleAt(2);
 
     expect(h.agent.prompts).toHaveLength(2);
-    // Without this the steer would sit queued until the whole loop finished.
+    // Without this the steer would sit queued until the whole goal finished.
     expect(h.agent.prompts[1]).toContain('顺便把日志也贴出来');
   });
 
-  it('refuses to start a second loop over a running one', async () => {
+
+  it('does not report a broken round as "goal achieved"', async () => {
+    // The round throws, so it never gets to write a signal. Reading that
+    // silence as "the agent decided it was done" would announce success for a
+    // round that died — the single most misleading thing this could do.
+    const h = await createHarness(['继续', undefined]);
+    h.agent.failRounds.add(1);
+    await startTestBridge(h);
+
+    await h.send('/goal 目标');
+    await h.settleAt(1);
+
+    expect(h.agent.prompts).toHaveLength(1);
+    const last = h.texts().at(-1) ?? '';
+    expect(last).toContain('目标未完成');
+    expect(last).not.toContain('已达成');
+  });
+
+  it('keeps queued messages when asked only for goal status', async () => {
+    const h = await createHarness(['继续', undefined]);
+    await startTestBridge(h);
+
+    await h.send('/goal 目标');
+    await h.waitForRuns(1);
+    await h.send('顺便把日志也贴出来');
+    // A status query is a report, not a new instruction — it must not discard
+    // the correction the next round was about to pick up.
+    await h.send('/goal');
+    await h.settleAt(2);
+
+    expect(h.agent.prompts[1]).toContain('顺便把日志也贴出来');
+  });
+
+  it('refuses to start a second goal over a running one', async () => {
     const h = await createHarness(['继续', undefined]);
     await startTestBridge(h);
 
@@ -186,6 +219,9 @@ class ScriptedAgent implements AgentAdapter {
   botIdentity: AgentBotIdentity | undefined;
   #round = 0;
 
+  /** Rounds listed here throw instead of producing events. */
+  failRounds = new Set<number>();
+
   constructor(private readonly script: Array<string | undefined>) {}
 
   async isAvailable(): Promise<boolean> {
@@ -200,11 +236,16 @@ class ScriptedAgent implements AgentAdapter {
     this.prompts.push(opts.prompt);
     const round = ++this.#round;
     const reason = this.script[round - 1];
+    const shouldFail = this.failRounds.has(round);
+    // Read the path out of the prompt, exactly as a real agent has to — which
+    // also means a round whose prompt carries no path cannot signal at all.
+    // Every prompt section is JSON-encoded (see `promptSection`), so the path
+    // arrives with escaped quotes around it — match the path itself.
+    const signalPath = /([^\s"\\]+\.continue)/.exec(opts.prompt)?.[1];
     const events = (async function* (): AsyncGenerator<AgentEvent> {
-      if (reason !== undefined) {
-        // The signal path is per (scope, round) — derive it the same way the
-        // bridge does rather than parsing it back out of the prompt.
-        await writeFile(goalSignalPath(SCOPE, round), reason, 'utf8');
+      if (shouldFail) throw new Error('adapter blew up mid-round');
+      if (reason !== undefined && signalPath) {
+        await writeFile(signalPath, reason, 'utf8');
       }
       // A round that finished instantly would leave no window for the tests
       // that act *during* one (/stop, a mid-loop steer) to land inside it.
@@ -256,10 +297,6 @@ async function createHarness(
   const agent = new ScriptedAgent(script);
   const channel = createFakeLarkChannel();
   sdkMock.channel = channel;
-  // Round 1 of every test starts from a clean signal file.
-  for (let round = 1; round <= script.length + 1; round++) {
-    await prepareGoalSignal(goalSignalPath(SCOPE, round));
-  }
   cleanups.push(async () => {
     await Promise.all([sessions.flush(), workspaces.flush()]);
     await tmp.cleanup();
@@ -286,10 +323,10 @@ async function createHarness(
     // tests short — they share the runner with everything else, and a slow
     // file here shows up as flakiness in someone else's timing test.
     waitForRuns: async (n) => {
-      for (let i = 0; i < 600 && agent.prompts.length < n; i++) await idle(10);
+      for (let i = 0; i < 300 && agent.prompts.length < n; i++) await idle(10);
     },
     settleAt: async (n) => {
-      for (let i = 0; i < 600 && agent.prompts.length < n; i++) await idle(10);
+      for (let i = 0; i < 300 && agent.prompts.length < n; i++) await idle(10);
       await idle(QUIET_MS);
     },
     texts: () =>

@@ -158,6 +158,15 @@ export interface CommandContext {
    * command layer needing to know how runs are launched.
    */
   enqueueTask?: (content: string) => void;
+  /**
+   * Keep messages queued behind a running turn instead of dropping them.
+   *
+   * Commands normally supersede queued chatter. That is wrong for a command
+   * that only reports state: asking `/goal` how a goal is doing would silently
+   * throw away the correction the user typed a moment earlier, which the goal's
+   * next round was about to pick up.
+   */
+  keepPending?: () => void;
 }
 
 type Handler = (args: string, ctx: CommandContext) => Promise<void>;
@@ -882,6 +891,9 @@ async function handleGoal(args: string, ctx: CommandContext): Promise<void> {
   }
   const arg = args.trim();
   const active = goals.get(ctx.scope);
+  // Everything except starting a *new* goal is a control/report action, and
+  // none of them should discard what the user queued for the current round.
+  if (arg === '' || arg === 'off' || arg === 'stop') ctx.keepPending?.();
 
   if (!arg) {
     if (active) {
