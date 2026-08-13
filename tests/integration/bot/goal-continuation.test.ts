@@ -241,6 +241,38 @@ describe('goal continuation', () => {
     expect(h.agent.prompts[1]).toContain('继续');
   });
 
+  it('retries a round the agent finished without saying anything', async () => {
+    // Observed in production: a `-p --resume` turn consumed by a pending
+    // task-notification returns `result` at zero cost, having never reached the
+    // model. The prompt was never seen — treating that as "the agent decided
+    // the goal was met" ended an eight-hour goal on its first round.
+    const h = await createHarness([undefined, '接着来', undefined]);
+    h.agent.noOutputRounds.add(1);
+    await startTestBridge(h);
+
+    await h.send('/goal 目标');
+    await h.settleAt(3);
+
+    // Round 1 said nothing → retried as round 1 again, which then worked.
+    expect(h.agent.prompts).toHaveLength(3);
+    expect(h.texts().at(-1)).toContain('目标已达成');
+  });
+
+  it('gives up after a second silent round, without claiming success', async () => {
+    const h = await createHarness([undefined, undefined]);
+    h.agent.noOutputRounds.add(1);
+    h.agent.noOutputRounds.add(2);
+    await startTestBridge(h);
+
+    await h.send('/goal 目标');
+    await h.settleAt(2);
+
+    expect(h.agent.prompts).toHaveLength(2);
+    const last = h.texts().at(-1) ?? '';
+    expect(last).toContain('目标未完成');
+    expect(last).not.toContain('已达成');
+  });
+
   it('keeps queued messages when asked only for goal status', async () => {
     const h = await createHarness(['继续', undefined]);
     await startTestBridge(h);
@@ -288,6 +320,8 @@ class ScriptedAgent implements AgentAdapter {
   errorAfterSignalRounds = new Set<number>();
   /** Rounds whose stream just stops, with no terminal event at all. */
   silentExitRounds = new Set<number>();
+  /** Rounds that finish cleanly having produced no output whatsoever. */
+  noOutputRounds = new Set<number>();
 
   constructor(private readonly script: Array<string | undefined>) {}
 
@@ -306,6 +340,7 @@ class ScriptedAgent implements AgentAdapter {
     const shouldFail = this.failRounds.has(round);
     const dieAfterSignal = this.errorAfterSignalRounds.has(round);
     const endWithoutDone = this.silentExitRounds.has(round);
+    const produceNothing = this.noOutputRounds.has(round);
     // Read the path out of the prompt, exactly as a real agent has to — which
     // also means a round whose prompt carries no path cannot signal at all.
     // Every prompt section is JSON-encoded (see `promptSection`), so the path
@@ -320,7 +355,7 @@ class ScriptedAgent implements AgentAdapter {
       // that act *during* one (/stop, a mid-goal steer) to land inside it.
       await new Promise((resolve) => setTimeout(resolve, ROUND_HOLD_MS));
       if (dieAfterSignal) throw new Error('tool wedged after the signal was written');
-      yield { type: 'text', delta: `第 ${round} 轮进度。` };
+      if (!produceNothing) yield { type: 'text', delta: `第 ${round} 轮进度。` };
       // Real agents say when they are finished. A stream that merely ends gets
       // `done` synthesised, which a goal must not read as "the agent finished".
       if (!endWithoutDone) yield { type: 'done', terminationReason: 'normal' };
