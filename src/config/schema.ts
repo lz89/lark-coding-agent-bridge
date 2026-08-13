@@ -115,6 +115,12 @@ export interface AppPreferences {
    */
   model?: string;
   /**
+   * Reasoning effort forwarded as `claude --effort` (`low` … `max`).
+   * `undefined` or the `'default'` sentinel omits the flag. Claude Code only —
+   * the Codex CLI has no equivalent, and the value is never forwarded there.
+   */
+  effort?: string;
+  /**
    * Whether to send a separate Lark COT process message before the final
    * answer. `brief` mirrors the lightweight tool/progress visibility from
    * the legacy tool display; `detailed` also includes tool args/output.
