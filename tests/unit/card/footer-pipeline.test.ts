@@ -102,6 +102,23 @@ describe('footer pipeline', () => {
     expect(renderText(state)).toContain('🧠 41K / 4% · Fable 5 · max');
   });
 
+  it('drops the percentage when the window cannot be attributed', () => {
+    // `modelUsage` is keyed by model id and never says which one produced the
+    // final message. With more than one, any denominator is a guess — so the
+    // token count stands alone rather than carrying a made-up percentage.
+    const twoModels = {
+      ...REAL_RESULT,
+      modelUsage: {
+        'claude-sonnet-5': { contextWindow: 1_000_000 },
+        'claude-opus-4-8': { contextWindow: 2_000_000 },
+      },
+    };
+    let state = initialState;
+    for (const evt of translateEvent(twoModels)) state = foldMeta(state, evt);
+    expect(state.meta?.contextWindow).toBeUndefined();
+    expect(renderFooterMeta(state.meta)).toBe('🧠 41K');
+  });
+
   it('never reports more context than the window holds', () => {
     // The bug this guards: summing the run's cumulative totals put the number
     // past 1M ("🧠 1.8M") on a 1M-window model.
