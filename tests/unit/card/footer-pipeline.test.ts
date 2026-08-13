@@ -18,10 +18,20 @@ const REAL_RESULT = {
   session_id: 'sess-1',
   total_cost_usd: 0.1001436,
   usage: {
-    input_tokens: 2,
-    cache_creation_input_tokens: 15_456,
-    cache_read_input_tokens: 24_422,
-    output_tokens: 5,
+    // Top-level totals: summed over every request the agentic loop made.
+    input_tokens: 8,
+    cache_creation_input_tokens: 15_764,
+    cache_read_input_tokens: 144_499,
+    output_tokens: 895,
+    // The final message's own request — the only usable basis for context.
+    iterations: [
+      {
+        input_tokens: 2,
+        output_tokens: 678,
+        cache_read_input_tokens: 40_113,
+        cache_creation_input_tokens: 75,
+      },
+    ],
   },
   modelUsage: {
     'claude-sonnet-5': { contextWindow: 1_000_000, costUSD: 0.1001436 },
@@ -32,13 +42,10 @@ const REAL_RESULT = {
 function foldMeta(state: RunState, evt: AgentEvent): RunState {
   if (evt.type === 'system' && evt.model) return withMeta(state, { model: evt.model });
   if (evt.type === 'usage') {
-    const contextTokens =
-      (evt.inputTokens ?? 0) +
-      (evt.cachedInputTokens ?? 0) +
-      (evt.cacheCreationInputTokens ?? 0) +
-      (evt.outputTokens ?? 0);
+    // Consumes what the adapter computed — summing the raw fields here is the
+    // very mistake that produced a fourfold-high number in the first place.
     return withMeta(state, {
-      contextTokens: contextTokens > 0 ? contextTokens : undefined,
+      contextTokens: evt.contextTokens,
       contextWindow: evt.contextWindow,
     });
   }
@@ -50,17 +57,17 @@ describe('footer pipeline', () => {
     const [usage] = [...translateEvent(REAL_RESULT)];
     expect(usage).toMatchObject({
       type: 'usage',
-      inputTokens: 2,
-      cachedInputTokens: 24_422,
-      cacheCreationInputTokens: 15_456,
-      outputTokens: 5,
+      inputTokens: 8,
+      cachedInputTokens: 144_499,
+      cacheCreationInputTokens: 15_764,
+      outputTokens: 895,
       contextWindow: 1_000_000,
     });
 
     const state = foldMeta(initialState, usage!);
-    // 2 + 24422 + 15456 + 5 = 39885 → 40K. Billed-only would read ~0K.
-    expect(state.meta?.contextTokens).toBe(39_885);
-    expect(renderFooterMeta(state.meta)).toBe('🧠 40K / 4%');
+    // Final request only: 2 + 40113 + 75 + 678.
+    expect(state.meta?.contextTokens).toBe(40_868);
+    expect(renderFooterMeta(state.meta)).toBe('🧠 41K / 4%');
   });
 
   it('reads the model the CLI actually loaded, not the one requested', () => {
@@ -84,15 +91,23 @@ describe('footer pipeline', () => {
 
     const card = renderCard(state) as { body: { elements: Array<Record<string, unknown>> } };
     const json = JSON.stringify(card);
-    expect(json).toContain('40K / 4%');
+    expect(json).toContain('41K / 4%');
     expect(json).toContain('Fable 5');
     expect(json).toContain('max');
     // Divider immediately precedes the footer note.
     const hrIndex = card.body.elements.findIndex((e) => e.tag === 'hr');
     expect(hrIndex).toBeGreaterThanOrEqual(0);
-    expect(JSON.stringify(card.body.elements[hrIndex + 1])).toContain('40K');
+    expect(JSON.stringify(card.body.elements[hrIndex + 1])).toContain('41K');
 
-    expect(renderText(state)).toContain('🧠 40K / 4% · Fable 5 · max');
+    expect(renderText(state)).toContain('🧠 41K / 4% · Fable 5 · max');
+  });
+
+  it('never reports more context than the window holds', () => {
+    // The bug this guards: summing the run's cumulative totals put the number
+    // past 1M ("🧠 1.8M") on a 1M-window model.
+    let state = initialState;
+    for (const evt of translateEvent(REAL_RESULT)) state = foldMeta(state, evt);
+    expect(state.meta!.contextTokens!).toBeLessThanOrEqual(state.meta!.contextWindow!);
   });
 
   it('shows no footer while the run is still going', () => {

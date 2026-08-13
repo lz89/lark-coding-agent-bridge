@@ -160,15 +160,15 @@ export class CodexJsonlTranslator {
     }
     const usage = recordValue(raw.usage);
     if (usage) {
-      const inputTokens = numberValue(usage.input_tokens ?? usage.inputTokens);
-      const outputTokens = numberValue(usage.output_tokens ?? usage.outputTokens);
-      // Codex/OpenAI report `input_tokens` as the *whole* prompt, with
-      // `cached_input_tokens` being the part of it that was cached — adding
-      // the two would count the cached span twice.
-      const contextTokens = (inputTokens ?? 0) + (outputTokens ?? 0);
+      // No context size is reported for Codex runs. `turn.completed.usage`
+      // looks like a per-turn *total* — i.e. summed over every model request
+      // the turn made — which is the same trap that made the Claude footer
+      // read four times high, and Codex exposes no per-request breakdown to
+      // recover the last request from. Until that is verified against a real
+      // multi-request turn, the footer drops the segment rather than risk a
+      // confidently wrong number.
       events.push({
         type: 'usage',
-        contextTokens: contextTokens > 0 ? contextTokens : undefined,
         inputTokens: numberValue(usage.input_tokens ?? usage.inputTokens),
         outputTokens: numberValue(usage.output_tokens ?? usage.outputTokens),
         cachedInputTokens: numberValue(usage.cached_input_tokens ?? usage.cachedInputTokens),
