@@ -1341,6 +1341,10 @@ async function runAgentBatch(deps: RunBatchDeps): Promise<RoundOutcome> {
   // vanished without a word".
   let roundEndSynthesised = false;
   const trackTerminal = (state: RunState): RunState => {
+    // Called both as each state is rendered and once on the resolved value. The
+    // former is what survives a terminal render that throws — the stream then
+    // rejects and never resolves, and reading only the resolved value would
+    // report a finished run as one that never ran.
     roundTerminal = state.terminal;
     roundEndSynthesised = state.endedWithoutTerminalEvent === true;
     return state;
@@ -1481,6 +1485,9 @@ async function runAgentBatch(deps: RunBatchDeps): Promise<RoundOutcome> {
         idleTimeoutMs,
         recordSession,
         async (state) => {
+          // Recorded before the update that may throw: a terminal state that
+          // reached us is a run that finished, even if showing it fails.
+          trackTerminal(state);
           latestState = state;
           if (shouldOpenProgressStream(filterForPrefs(state))) progress.ensureOpen();
           if (cardCtrl) {
@@ -1561,6 +1568,8 @@ async function runAgentBatch(deps: RunBatchDeps): Promise<RoundOutcome> {
         idleTimeoutMs,
         recordSession,
         async (state) => {
+          // See the card branch: recorded before the update that may throw.
+          trackTerminal(state);
           latestState = state;
           if (shouldOpenProgressStream(filterForPrefs(state))) progress.ensureOpen();
           if (markdownCtrl) {
