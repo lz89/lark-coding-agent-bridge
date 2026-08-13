@@ -1,4 +1,5 @@
 import { maskEmails } from './mask-email';
+import { renderFooterMeta } from './run-footer';
 import type { Block, RunState, StallNotice, ToolEntry } from './run-state';
 import { toolHeaderText } from './tool-render';
 
@@ -32,6 +33,11 @@ export function renderText(state: RunState): string {
   } else if (state.terminal === 'running') {
     if (state.stalled) parts.push(`_⏳ ${stallText(state.stalled)}_`);
     if (state.footer) parts.push(footerLine(state.footer));
+  }
+
+  if (state.terminal !== 'running') {
+    const footer = renderFooterMeta(state.meta);
+    if (footer) parts.push(`---\n${footer}`);
   }
 
   // Strip raw emails so the Feishu tenant audit doesn't reject the message

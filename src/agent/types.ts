@@ -15,6 +15,10 @@ export type AgentEvent =
       inputTokens?: number;
       outputTokens?: number;
       cachedInputTokens?: number;
+      /** `cache_creation_input_tokens` — part of the prompt, so part of context. */
+      cacheCreationInputTokens?: number;
+      /** Model's context window, reported by the CLI. Used for the % on the footer. */
+      contextWindow?: number;
       reasoningOutputTokens?: number;
       costUsd?: number;
     }
