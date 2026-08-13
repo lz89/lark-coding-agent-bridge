@@ -224,6 +224,23 @@ describe('goal continuation', () => {
     expect(h.agent.prompts[1]).toContain('继续');
   });
 
+  it('keeps going when the run finished but its card update threw', async () => {
+    // The run reached a real `done`, which the flush saw — then rendering it
+    // failed, so the stream rejected and never resolved. Reading only the
+    // resolved value called a finished run one that never ran, ending the goal
+    // with "目标未完成" on a round that had just asked to continue.
+    const h = await createHarness(['继续', undefined], { messageReply: 'card' });
+    // 1 = the producer's own first render, 2 = the text event, 3 = `done`.
+    h.channel.failCardUpdatesFrom = 3;
+    await startTestBridge(h);
+
+    await h.send('/goal 目标');
+    await h.settleAt(2);
+
+    expect(h.agent.prompts).toHaveLength(2);
+    expect(h.agent.prompts[1]).toContain('继续');
+  });
+
   it('keeps queued messages when asked only for goal status', async () => {
     const h = await createHarness(['继续', undefined]);
     await startTestBridge(h);
@@ -412,6 +429,8 @@ interface FakeLarkChannel {
   botIdentity: { openId: string; name: string };
   /** Make `send` throw from the Nth call on, to model a Feishu outage. */
   failSendsFrom?: number;
+  /** Make streaming card updates throw from the Nth call on. */
+  failCardUpdatesFrom?: number;
   handlers: MessageHandlerMap;
   sent: Array<{ chatId: string; content: unknown }>;
   rawClient: Record<string, unknown>;
@@ -476,7 +495,16 @@ function createFakeLarkChannel(): FakeLarkChannel {
         | { card?: { producer?: (ctrl: { update(c: unknown): Promise<void> }) => Promise<void> } }
         | undefined;
       if (typeof cardInput?.card?.producer === 'function') {
-        await cardInput.card.producer({ async update() {} });
+        let updates = 0;
+        const failFrom = this.failCardUpdatesFrom;
+        await cardInput.card.producer({
+          async update() {
+            updates++;
+            if (failFrom !== undefined && updates >= failFrom) {
+              throw new Error('card update rejected');
+            }
+          },
+        });
       }
     },
     async recallMessage() {},
