@@ -924,6 +924,10 @@ async function driveScopeRun(deps: GoalDriveDeps): Promise<void> {
   // Held outside the loop so the catch below can close the right goal.
   let goalId: string | undefined;
   let round = 0;
+  // A round that produced nothing gets one retry before the goal gives up. The
+  // known cause is transient — the next run picks the prompt back up — and the
+  // alternative is ending a multi-hour goal on a turn the agent never saw.
+  let silentRetries = 0;
 
   try {
     for (;;) {
@@ -953,7 +957,7 @@ async function driveScopeRun(deps: GoalDriveDeps): Promise<void> {
       if (!state || !signalPath) return;
 
       const signal = await readGoalSignal(signalPath);
-      const endRound = (stop: 'done' | 'run-failed'): Promise<void> | undefined => {
+      const endRound = (stop: 'done' | 'run-failed' | 'silent'): Promise<void> | undefined => {
         // `expectId` guards the window where `/goal off` during this round was
         // followed by a new goal: without it this round would close that one.
         const ended = goals.end(scope, stop, { expectId: state.id, roundsRun: round });
@@ -978,9 +982,21 @@ async function driveScopeRun(deps: GoalDriveDeps): Promise<void> {
         return;
       }
       if (signal.kind === 'none') {
+        // The agent said nothing and signalled nothing. It did not decide the
+        // goal was met — most likely it never saw the prompt.
+        if (outcome === 'completed-silent') {
+          if (silentRetries < 1) {
+            silentRetries++;
+            log.warn('goal', 'silent-round-retry', { scope, round });
+            continue;
+          }
+          await endRound('silent');
+          return;
+        }
         await endRound('done');
         return;
       }
+      silentRetries = 0;
 
       const reason = signal.reason;
       const advance = goals.advance(scope, state.id, reason, Date.now());
@@ -1077,7 +1093,7 @@ async function sendGoalNotice(
  * a dead round ends goals over one Feishu blip, and treating a killed run as a
  * finished one continues a goal on a round that died mid-tool.
  */
-type RoundOutcome = 'completed' | 'delivery-failed' | 'run-failed';
+type RoundOutcome = 'completed' | 'completed-silent' | 'delivery-failed' | 'run-failed';
 
 async function runAgentBatch(deps: RunBatchDeps): Promise<RoundOutcome> {
   const {
@@ -1340,6 +1356,12 @@ async function runAgentBatch(deps: RunBatchDeps): Promise<RoundOutcome> {
   // for a goal that is the difference between "achieved" and "the process
   // vanished without a word".
   let roundEndSynthesised = false;
+  // Whether the agent produced anything at all this round. A headless run can
+  // finish cleanly having said nothing — a `-p --resume` turn consumed by
+  // pending task-notifications or queue bookkeeping returns `result` at zero
+  // cost without ever reaching the model. Silence is not a decision, so a goal
+  // must not read it as "achieved".
+  let roundHadOutput = false;
   const trackTerminal = (state: RunState): RunState => {
     // Called both as each state is rendered and once on the resolved value. The
     // former is what survives a terminal render that throws — the stream then
@@ -1347,6 +1369,7 @@ async function runAgentBatch(deps: RunBatchDeps): Promise<RoundOutcome> {
     // report a finished run as one that never ran.
     roundTerminal = state.terminal;
     roundEndSynthesised = state.endedWithoutTerminalEvent === true;
+    roundHadOutput = hasDeliverableContent(state);
     return state;
   };
   /**
@@ -1355,7 +1378,8 @@ async function runAgentBatch(deps: RunBatchDeps): Promise<RoundOutcome> {
    * not in the outer catch). Either way the run did not reach `done`.
    */
   const runReachedDone = (): boolean => roundTerminal === 'done' && !roundEndSynthesised;
-  const outcome = (): RoundOutcome => (runReachedDone() ? 'completed' : 'run-failed');
+  const outcome = (): RoundOutcome =>
+    runReachedDone() ? (roundHadOutput ? 'completed' : 'completed-silent') : 'run-failed';
 
   const replyMode = getMessageReplyMode(controls.cfg);
   log.info('flush', 'reply-mode', { mode: replyMode });

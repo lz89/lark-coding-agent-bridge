@@ -72,7 +72,8 @@ export type GoalStop =
   | 'deadline'
   | 'stuck'
   | 'cancelled'
-  | 'run-failed';
+  | 'run-failed'
+  | 'silent';
 
 export interface GoalStartInput {
   scope: string;
@@ -214,7 +215,7 @@ export class GoalController {
    */
   end(
     scope: string,
-    stop: Extract<GoalStop, 'done' | 'cancelled' | 'run-failed'>,
+    stop: Extract<GoalStop, 'done' | 'cancelled' | 'run-failed' | 'silent'>,
     opts: { expectId?: string; roundsRun?: number } = {},
   ): GoalState | undefined {
     const state = this.data.entries[scope];
@@ -436,6 +437,13 @@ export function goalStopText(stop: GoalStop, state: GoalState): string {
   const rounds = `共 ${state.round} 轮`;
   if (stop === 'done') return `✅ 闭环模式结束(${rounds}):agent 判定目标已达成。`;
   if (stop === 'cancelled') return `⏹ 闭环模式已取消(${rounds})。`;
+  if (stop === 'silent') {
+    return (
+      `⚠️ 闭环模式已停(${rounds}):agent 连续两轮一个字都没输出,也没写信号。**目标未完成** —— ` +
+      '这不是它判定做完了,是它很可能根本没看到这一轮的输入(headless run 被上一轮遗留的' +
+      '后台任务通知吃掉时会这样,零成本返回)。用 `/goal <目标>` 重开一般就好了。'
+    );
+  }
   if (stop === 'run-failed') {
     return (
       `⚠️ 闭环模式已停(${rounds}):本轮运行出错,没跑完。**目标未完成** —— ` +
