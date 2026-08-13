@@ -78,7 +78,6 @@ import {
   GoalController,
   goalContinuationTurn,
   goalProtocolInstruction,
-  goalSignalPath,
   goalStopText,
   prepareGoalSignal,
   readGoalSignal,
@@ -928,7 +927,7 @@ async function driveScopeRun(deps: GoalDriveDeps): Promise<void> {
       if (state) {
         goalId = state.id;
         round = state.round + 1;
-        signalPath = goalSignalPath(state.id, round);
+        signalPath = goals.signalPath(state.id, round);
         await prepareGoalSignal(signalPath);
         goalMode = {
           round,
@@ -947,23 +946,37 @@ async function driveScopeRun(deps: GoalDriveDeps): Promise<void> {
       const outcome = await runAgentBatch({ ...deps, batch, ...(goalMode ? { goalMode } : {}) });
       if (!state || !signalPath) return;
 
-      const reason = await readGoalSignal(signalPath);
-      // A round whose reply path threw never got to decide whether it was done,
-      // and usually never got to write a signal either. Reading that silence as
-      // "goal achieved" would announce success for a round that broke.
-      if (outcome === 'failed') {
-        const failed = goals.end(scope, 'run-failed', { expectId: state.id, roundsRun: round });
-        if (failed) await sendGoalNotice(channel, anchor, mode, goalStopText('run-failed', failed));
-        return;
-      }
-      if (!reason) {
+      const signal = await readGoalSignal(signalPath);
+      const endRound = (stop: 'done' | 'run-failed'): Promise<void> | undefined => {
         // `expectId` guards the window where `/goal off` during this round was
         // followed by a new goal: without it this round would close that one.
-        const ended = goals.end(scope, 'done', { expectId: state.id, roundsRun: round });
-        if (ended) await sendGoalNotice(channel, anchor, mode, goalStopText('done', ended));
+        const ended = goals.end(scope, stop, { expectId: state.id, roundsRun: round });
+        return ended ? sendGoalNotice(channel, anchor, mode, goalStopText(stop, ended)) : undefined;
+      };
+
+      // A round whose run did not reach a clean end never got to decide whether
+      // it was done, and usually never got to write a signal either. Reading
+      // that silence as "goal achieved" would announce success for a round that
+      // broke. A round that *did* signal is believed regardless: the agent
+      // finished its work, and only delivery failed after that.
+      if (outcome === 'failed' && signal.kind !== 'continue') {
+        await endRound('run-failed');
+        return;
+      }
+      // Absent is "done"; unreadable is not. Treating a broken signal channel
+      // as silence would report every goal as achieved the moment /tmp went
+      // read-only.
+      if (signal.kind === 'unreadable') {
+        log.warn('goal', 'signal-unreadable', { scope, round, err: signal.error });
+        await endRound('run-failed');
+        return;
+      }
+      if (signal.kind === 'none') {
+        await endRound('done');
         return;
       }
 
+      const reason = signal.reason;
       const advance = goals.advance(scope, state.id, reason, Date.now());
       // Gone or replaced — `/stop`, `/goal off`, or a different goal now owns
       // this scope. Either way this round does not get to extend anything.
@@ -1246,8 +1259,11 @@ async function runAgentBatch(deps: RunBatchDeps): Promise<RoundOutcome> {
       code: flow.rejectReason.code,
     });
     await channel.send(chatId, { markdown: flow.rejectReason.userVisible }, sendOpts);
-    // A rejected run never started; that is a clean outcome, not a broken round.
-    return 'completed';
+    // The agent never started — an unusable cwd, a full pool, a denied policy.
+    // The reason went to the user already, but for a goal this is emphatically
+    // not "round finished": calling it completed would close the goal as
+    // achieved on a round that never ran.
+    return 'failed';
   }
 
   const { execution, cwdRealpath: cwd } = flow;
@@ -1611,10 +1627,11 @@ async function runAgentBatch(deps: RunBatchDeps): Promise<RoundOutcome> {
     }
   } catch (err) {
     log.fail('stream', err);
-    // Swallowed so one broken reply cannot take the bridge down — but reported,
-    // because a caller that treats this as a normal finish (see `driveScopeRun`)
-    // would announce a result the round never reached.
-    return 'failed';
+    // Swallowed so one broken reply cannot take the bridge down. The outcome
+    // still comes from the run's own terminal state: a send that failed *after*
+    // the agent finished is a delivery problem, and reporting it as a round
+    // that never ran would end a goal the agent had just asked to continue.
+    return outcome();
   } finally {
     activePolicyFingerprints.delete(scope);
     scheduleWorkingReactionCleanup(channel, lastMsg.messageId, reactionPromise);

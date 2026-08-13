@@ -1,7 +1,7 @@
 import { randomUUID } from 'node:crypto';
 import { mkdir, readFile, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
 import { log } from '../core/logger';
 import { writeFileAtomic } from '../platform/atomic-write';
 
@@ -89,6 +89,15 @@ export class GoalController {
   private data: GoalData = { entries: {} };
   private saving: Promise<void> = Promise.resolve();
   private readonly path: string | undefined;
+  /**
+   * Where continuation signals are written.
+   *
+   * Next to the goal file rather than in `os.tmpdir()`: a tmp cleaner removing
+   * a signal between the agent writing it and the bridge reading it is
+   * indistinguishable from the agent never writing one, and that reads as
+   * "goal achieved". Memory-only controllers (tests) have nowhere better.
+   */
+  readonly signalDir: string;
 
   /**
    * `path` is the profile's goal file. Omitting it makes the controller
@@ -98,13 +107,21 @@ export class GoalController {
    */
   constructor(path?: string) {
     this.path = path;
+    this.signalDir = path
+      ? join(dirname(path), 'goal-signals')
+      : join(tmpdir(), 'lark-channel-goal');
+  }
+
+  /** This round's signal file. See {@link signalDir} and {@link GoalState.id}. */
+  signalPath(goalId: string, round: number): string {
+    return join(this.signalDir, `${goalId}.${round}.continue`);
   }
 
   async load(): Promise<void> {
     if (!this.path) return;
     try {
       const parsed = JSON.parse(await readFile(this.path, 'utf8')) as Partial<GoalData>;
-      this.data = { entries: parsed.entries ?? {} };
+      this.data = { entries: adoptEntries(parsed.entries) };
     } catch (err) {
       if ((err as NodeJS.ErrnoException).code === 'ENOENT') return;
       log.warn('goal', 'load-failed', { err: String(err) });
@@ -254,42 +271,67 @@ export class GoalController {
   }
 }
 
+/**
+ * Give every loaded goal an id.
+ *
+ * `id` is what stops a finished round from acting on a different goal, and what
+ * keeps two goals' signal files apart. A record written before ids existed — or
+ * one hand-edited — would silently disable both: `expectId: undefined` skips
+ * the identity check, and every such goal shares the signal path
+ * `undefined.<round>.continue`. Minting one on load restores both guarantees,
+ * and costs nothing for records that already have one.
+ */
+function adoptEntries(entries: Record<string, GoalState> | undefined): Record<string, GoalState> {
+  const out: Record<string, GoalState> = {};
+  for (const [scope, state] of Object.entries(entries ?? {})) {
+    if (!state || typeof state !== 'object') continue;
+    out[scope] = typeof state.id === 'string' && state.id ? state : { ...state, id: randomUUID() };
+  }
+  return out;
+}
+
 function clamp(value: number, min: number, max: number): number {
   if (!Number.isFinite(value)) return min;
   return Math.min(Math.max(Math.floor(value), min), max);
 }
 
 /**
- * Where this round's continuation signal goes.
+ * What this round's signal file said.
  *
- * Keyed by goal id rather than by scope: two bots can share a chat, and one
- * scope can run goals back to back whose round numbers both start at 1 — either
- * would collide on a scope-keyed path, letting one goal consume or delete
- * another's signal. One path per (goal, round) also means a leftover file can
- * never drive a later round, which is the failure that burns tokens unattended.
+ * `unreadable` exists because "the agent chose not to continue" and "we could
+ * not find out" look identical on disk, and collapsing them means a broken
+ * signal channel silently reports every goal as achieved.
  */
-export function goalSignalPath(goalId: string, round: number): string {
-  return join(tmpdir(), 'lark-channel-goal', `${goalId}.${round}.continue`);
-}
+export type GoalSignal =
+  | { kind: 'none' }
+  | { kind: 'continue'; reason: string }
+  | { kind: 'unreadable'; error: string };
 
 /** Read this round's signal and consume it, so it can only ever count once. */
-export async function readGoalSignal(path: string): Promise<string | undefined> {
+export async function readGoalSignal(path: string): Promise<GoalSignal> {
   let raw: string;
   try {
     raw = await readFile(path, 'utf8');
-  } catch {
-    return undefined;
+  } catch (err) {
+    // Absent is the normal "done" case. Anything else — permissions, a broken
+    // mount, an I/O error — means the answer is unknown, not "no".
+    if ((err as NodeJS.ErrnoException).code === 'ENOENT') return { kind: 'none' };
+    return { kind: 'unreadable', error: String(err) };
   } finally {
     await rm(path, { force: true }).catch(() => {});
   }
   const reason = raw.trim().slice(0, REASON_MAX_CHARS);
-  return reason || undefined;
+  return reason ? { kind: 'continue', reason } : { kind: 'none' };
 }
 
-/** Make sure a stale file from a previous life can't be read as this round's. */
+/**
+ * Make sure a stale file can't be read as this round's, and that the directory
+ * exists. Throws if it cannot: starting a round whose signal can never be
+ * written would end the goal as "achieved" the moment the round finished.
+ */
 export async function prepareGoalSignal(path: string): Promise<void> {
-  await mkdir(join(tmpdir(), 'lark-channel-goal'), { recursive: true }).catch(() => {});
-  await rm(path, { force: true }).catch(() => {});
+  await mkdir(dirname(path), { recursive: true });
+  await rm(path, { force: true });
 }
 
 /**

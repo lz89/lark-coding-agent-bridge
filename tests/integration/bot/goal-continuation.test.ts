@@ -178,6 +178,21 @@ describe('goal continuation', () => {
     expect(last).not.toContain('已达成');
   });
 
+  it('keeps going when the round finished but its reply failed to send', async () => {
+    // The agent reached the end and asked for another round; only delivery
+    // broke. Ending the goal there would let one Feishu blip kill hours of
+    // work the agent had explicitly said was unfinished.
+    const h = await createHarness(['继续', undefined]);
+    h.channel.failSendsFrom = 1;
+    await startTestBridge(h);
+
+    await h.send('/goal 目标');
+    await h.settleAt(2);
+
+    expect(h.agent.prompts).toHaveLength(2);
+    expect(h.agent.prompts[1]).toContain('继续');
+  });
+
   it('keeps queued messages when asked only for goal status', async () => {
     const h = await createHarness(['继续', undefined]);
     await startTestBridge(h);
@@ -354,6 +369,8 @@ interface MessageHandlerMap {
 
 interface FakeLarkChannel {
   botIdentity: { openId: string; name: string };
+  /** Make `send` throw from the Nth call on, to model a Feishu outage. */
+  failSendsFrom?: number;
   handlers: MessageHandlerMap;
   sent: Array<{ chatId: string; content: unknown }>;
   rawClient: Record<string, unknown>;
@@ -408,6 +425,9 @@ function createFakeLarkChannel(): FakeLarkChannel {
     },
     async send(chatId, content) {
       sent.push({ chatId, content });
+      if (this.failSendsFrom !== undefined && sent.length >= this.failSendsFrom) {
+        throw new Error('feishu send failed');
+      }
       return { messageId: `sent_${sent.length}` };
     },
     async stream(_chatId, input) {

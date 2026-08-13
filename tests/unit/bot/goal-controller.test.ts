@@ -1,10 +1,9 @@
-import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import {
   GoalController,
-  goalSignalPath,
   goalStopText,
   prepareGoalSignal,
   readGoalSignal,
@@ -182,42 +181,94 @@ describe('GoalController', () => {
 
 describe('loop signal file', () => {
   it('reads the reason once and then forgets it', async () => {
-    const path = goalSignalPath('goal-a', 1);
+    const path = controller.signalPath('goal-a', 1);
     await prepareGoalSignal(path);
     await writeFile(path, '  等 make 收尾\n');
-    expect(await readGoalSignal(path)).toBe('等 make 收尾');
-    // Consumed: a second read must not extend the loop again.
-    expect(await readGoalSignal(path)).toBeUndefined();
+    expect(await readGoalSignal(path)).toEqual({ kind: 'continue', reason: '等 make 收尾' });
+    // Consumed: a second read must not extend the goal again.
+    expect(await readGoalSignal(path)).toEqual({ kind: 'none' });
   });
 
   it('reports no signal when the agent wrote nothing', async () => {
-    const path = goalSignalPath('goal-a', 2);
+    const path = controller.signalPath('goal-a', 2);
     await prepareGoalSignal(path);
-    expect(await readGoalSignal(path)).toBeUndefined();
+    expect(await readGoalSignal(path)).toEqual({ kind: 'none' });
   });
 
   it('treats an empty write as "done", not as a reason to continue', async () => {
-    const path = goalSignalPath('goal-a', 3);
+    const path = controller.signalPath('goal-a', 3);
     await prepareGoalSignal(path);
     await writeFile(path, '   \n\n');
-    expect(await readGoalSignal(path)).toBeUndefined();
+    expect(await readGoalSignal(path)).toEqual({ kind: 'none' });
   });
 
   it('gives every round its own path so a stale file cannot re-trigger', async () => {
-    const first = goalSignalPath('goal-a', 1);
-    expect(goalSignalPath('goal-a', 2)).not.toBe(first);
-    expect(goalSignalPath('goal-b', 1)).not.toBe(first);
+    const first = controller.signalPath('goal-a', 1);
+    expect(controller.signalPath('goal-a', 2)).not.toBe(first);
+    expect(controller.signalPath('goal-b', 1)).not.toBe(first);
     // Two goals in the same scope both start at round 1; keying by goal id is
     // what stops the second from consuming the first's leftover signal.
-    expect(goalSignalPath('goal-b', 1)).not.toBe(goalSignalPath('goal-a', 1));
+    expect(controller.signalPath('goal-b', 1)).not.toBe(controller.signalPath('goal-a', 1));
   });
 
   it('clears a leftover file before the round starts', async () => {
-    const path = goalSignalPath('goal-a', 4);
+    const path = controller.signalPath('goal-a', 4);
     await prepareGoalSignal(path);
     await writeFile(path, 'stale');
     await prepareGoalSignal(path);
-    expect(await readGoalSignal(path)).toBeUndefined();
+    expect(await readGoalSignal(path)).toEqual({ kind: 'none' });
+  });
+
+  it('never reports "no signal" when it simply could not read one', async () => {
+    // A directory where a file is expected stands in for any unreadable path
+    // (a read-only /tmp, a broken mount). Collapsing this into "none" would let
+    // a broken signal channel report every goal as achieved.
+    const path = controller.signalPath('goal-a', 9);
+    await prepareGoalSignal(path);
+    await mkdir(path, { recursive: true });
+    const signal = await readGoalSignal(path);
+    expect(signal.kind).toBe('unreadable');
+    await rm(path, { recursive: true, force: true });
+  });
+
+  it('fails loudly when the signal file cannot be prepared', async () => {
+    // Starting a round whose signal can never be written would end the goal as
+    // "achieved" the moment that round finished.
+    const blocked = new GoalController(join(dir, 'blocked', 'goals.json'));
+    await writeFile(join(dir, 'blocked'), 'not a directory');
+    await expect(prepareGoalSignal(blocked.signalPath('goal-a', 1))).rejects.toThrow();
+  });
+});
+
+describe('loading goals written by an older bridge', () => {
+  it('mints an id for a record that has none', async () => {
+    // Without an id `expectId` checks are skipped and every such goal shares
+    // the signal path `undefined.<round>.continue`.
+    const path = join(dir, 'legacy.json');
+    await writeFile(
+      path,
+      JSON.stringify({
+        entries: {
+          oc_1: {
+            scope: 'oc_1',
+            goal: '旧目标',
+            round: 2,
+            startedAt: T0,
+            deadlineAt: T0 + HOUR,
+            maxRounds: 20,
+            chatId: 'oc_1',
+            sameReasonStreak: 0,
+            status: 'active',
+          },
+        },
+      }),
+    );
+    const loaded = new GoalController(path);
+    await loaded.load();
+    const state = loaded.get('oc_1');
+    expect(state?.id).toMatch(/[0-9a-f-]{36}/);
+    expect(state?.goal).toBe('旧目标');
+    expect(loaded.signalPath(state!.id, 1)).not.toContain('undefined');
   });
 });
 
