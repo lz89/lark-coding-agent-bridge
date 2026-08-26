@@ -55,9 +55,43 @@ describe('bridge system prompt detached-job reporting', () => {
     expect(BRIDGE_SYSTEM_PROMPT).toContain('活过本轮');
   });
 
-  it('requires the agent to send its own completion notice', () => {
-    expect(BRIDGE_SYSTEM_PROMPT).toContain('你 detach，你负责回执');
-    expect(BRIDGE_SYSTEM_PROMPT).toContain('lark-cli im send');
+  it('routes the completion notice through the wake file, not a chat message', () => {
+    expect(BRIDGE_SYSTEM_PROMPT).toContain('bridge 会把你叫回来');
+    expect(BRIDGE_SYSTEM_PROMPT).toContain('bridge_context.wakePrefix');
+  });
+
+  it('shows the unique-name-then-rename form, not a fixed filename', () => {
+    // A fixed name loses one of two concurrent reports; writing `.wake` in
+    // place can be swept half-written.
+    expect(BRIDGE_SYSTEM_PROMPT).toContain('mktemp');
+    expect(BRIDGE_SYSTEM_PROMPT).toContain('mv "$f" "$f.wake"');
+  });
+
+  it('names the lark-cli subcommand that actually exists', () => {
+    // `lark-cli im send` / `im send-card` are not commands — both fail with
+    // "unknown subcommand", which the agent then has to discover at runtime.
+    expect(BRIDGE_SYSTEM_PROMPT).toContain('+messages-send');
+    expect(BRIDGE_SYSTEM_PROMPT).not.toContain('lark-cli im send ');
+    expect(BRIDGE_SYSTEM_PROMPT).not.toContain('lark-cli im send-card');
+  });
+
+  it('makes every outbound send example use the bot identity', () => {
+    // Sending as the user makes the message look like the user wrote it, and
+    // in a p2p chat it comes back through intake as a fresh user turn. Asserted
+    // per example, not once for the whole prompt: an agent copies the nearest
+    // concrete command, so one example missing the flag is enough to reproduce
+    // the impersonation.
+    const sends = BRIDGE_SYSTEM_PROMPT.split('\n').filter((line) =>
+      line.includes('+messages-send') && line.includes('--chat-id'),
+    );
+    expect(sends.length).toBeGreaterThan(0);
+    for (const line of sends) expect(line).toContain('--as bot');
+  });
+
+  it('names bridge_context fields as they actually appear', () => {
+    // The block is JSON: `chatId`, not `chat_id`. A snake_case reference sends
+    // the agent looking for a key that is not there.
+    expect(BRIDGE_SYSTEM_PROMPT).not.toContain('bridge_context.chat_id');
   });
 
   it('pins the notice to the bridge_context chat rather than a hardcoded id', () => {
@@ -71,7 +105,7 @@ describe('bridge system prompt detached-job reporting', () => {
   });
 
   it('requires failures to be reported, not just successes', () => {
-    expect(BRIDGE_SYSTEM_PROMPT).toContain('只在成功时通知，等于把失败变成静默');
+    expect(BRIDGE_SYSTEM_PROMPT).toContain('只在成功时回执，等于把失败变成静默');
     expect(BRIDGE_SYSTEM_PROMPT).toContain('退出码');
   });
 

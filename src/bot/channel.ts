@@ -82,6 +82,14 @@ import {
   prepareGoalSignal,
   readGoalSignal,
 } from './goal';
+import {
+  WakeInbox,
+  wakeDirFor,
+  wakeNoticeText,
+  wakeTurn,
+  type Wake,
+  type WakeRoute,
+} from './wake';
 import { recordRunSessionEvent, startRunFlow } from './run-flow';
 import { commandSessionCatalogIdentity } from './session-catalog-identity';
 import { startKeepalive } from './keepalive';
@@ -225,10 +233,15 @@ export async function startChannel(deps: StartChannelDeps): Promise<BridgeChanne
   // `/goal` continuation state. Persisted next to the other per-profile
   // state so a restart — which kills every in-flight run — can still tell the
   // user which goal it cut off, and let them resume it.
-  const goals = new GoalController(
-    deps.appPaths?.mediaDir ? join(dirname(deps.appPaths.mediaDir), 'goals.json') : undefined,
-  );
+  const goalsPath = deps.appPaths?.mediaDir
+    ? join(dirname(deps.appPaths.mediaDir), 'goals.json')
+    : undefined;
+  const goals = new GoalController(goalsPath);
   await goals.load();
+  // 后台回执 inbox. Shares the profile directory with the goal state for the
+  // same reason: a detached job can outlive several restarts, and its wake has
+  // to survive being written while no bridge is listening.
+  const wake = new WakeInbox(goalsPath ? wakeDirFor(goalsPath) : undefined);
 
   // Resolve the App Secret to plaintext. The config field can be a literal
   // string, a "${VAR}" template, or a {source, id} SecretRef referencing
@@ -359,6 +372,7 @@ export async function startChannel(deps: StartChannelDeps): Promise<BridgeChanne
           mode,
           goals,
           pending,
+          wake,
         });
       } catch (err) {
         log.fail('flush', err);
@@ -544,6 +558,14 @@ export async function startChannel(deps: StartChannelDeps): Promise<BridgeChanne
     .sweepSignals(Date.now())
     .catch((err) => log.warn('goal', 'signal-sweep-failed', { err: String(err) }));
 
+  // Awaited before the sweeper starts, not fired alongside it: housekeeping
+  // hands back reports a previous process died mid-delivery, and a sweep
+  // running at the same time could be holding one of those very files.
+  await wake
+    .sweepStale(Date.now())
+    .catch((err) => log.warn('wake', 'stale-sweep-failed', { err: String(err) }));
+  wake.start((w) => handleWake({ channel, pending, wake: w }));
+
   for (const cut of goals.markInterrupted()) {
     void channel
       .send(cut.chatId, {
@@ -575,6 +597,10 @@ export async function startChannel(deps: StartChannelDeps): Promise<BridgeChanne
       ownerRefresh.stop();
       knownChatsRefresh.stop();
       keepalive.stop();
+      // Awaited before `pending.cancelAll()` below: a wake mid-dispatch has
+      // already consumed its file, and letting it queue after the drain would
+      // start a run against a channel that is closing.
+      await wake.stop();
       // Stop meeting timers but stay in the meetings: /reconnect tears the
       // channel down and rebuilds it, and auto-leaving every meeting on a
       // reconnect would be surprising.
@@ -889,6 +915,8 @@ interface RunBatchDeps {
   lastRunModelByScope: Map<string, string>;
   scope: string;
   mode: ChatMode;
+  /** 后台回执 inbox — re-armed each run so a wake routes to the live chat. */
+  wake: WakeInbox;
   /** Set when this run is one round of a `/goal` continuation. */
   goalMode?: GoalRunContext;
 }
@@ -1044,6 +1072,75 @@ async function driveScopeRun(deps: GoalDriveDeps): Promise<void> {
 }
 
 /**
+ * Deliver one 后台回执: show it, then hand it to the agent.
+ *
+ * Both halves matter and they are not the same act. Posting is what the user
+ * sees — with the bot's name on it, which is the whole point of replacing the
+ * old "send it as the user" path. Injecting is what continues the work, and it
+ * goes through `pending` rather than starting a run directly so it obeys every
+ * rule an ordinary message does: it merges with anything else waiting, it waits
+ * out a run already in flight, and a `/goal` round absorbs it instead of
+ * racing it.
+ *
+ * A failure to post is not a reason to drop the wake — the job reported
+ * something real, and losing it because Feishu blipped is the exact silence
+ * this channel exists to prevent. But the agent is told the post failed, so it
+ * knows the user has not seen the report and puts the content in its reply
+ * instead of acknowledging something nobody read.
+ */
+async function handleWake(deps: {
+  channel: LarkChannel;
+  pending: PendingQueue;
+  wake: Wake;
+}): Promise<void> {
+  const { channel, pending, wake } = deps;
+  const { route, text, kind } = wake;
+  let posted = true;
+  try {
+    await channel.send(route.chatId, { markdown: wakeNoticeText(text) }, {
+      replyTo: route.anchorId,
+      ...(route.mode === 'topic' && route.threadId ? { replyInThread: true } : {}),
+    });
+  } catch (err) {
+    posted = false;
+    log.warn('wake', 'notice-failed', { scope: route.scope, err: String(err) });
+  }
+  if (kind !== 'wake') return;
+  const size = pending.push(route.scope, wakeMessage(route, wakeTurn(text, { posted })));
+  log.info('wake', 'queued', { scope: route.scope, queueSize: size, posted });
+}
+
+/**
+ * The synthetic message a wake enters the queue as.
+ *
+ * Modelled on the anchor's routing (its `messageId` is what replies thread to)
+ * and attributed to the person whose run launched the job — see
+ * {@link WakeRoute.senderId}. Carries no resources or mentions: there is no
+ * Feishu message behind it to re-fetch.
+ */
+function wakeMessage(route: WakeRoute, content: string): NormalizedMessage {
+  return {
+    messageId: route.anchorId,
+    chatId: route.chatId,
+    chatType: route.mode === 'p2p' ? 'p2p' : 'group',
+    ...(route.mode !== 'p2p' ? { chatMode: route.mode } : {}),
+    senderId: route.senderId,
+    senderName: '后台回执',
+    content,
+    rawContentType: 'text',
+    resources: [],
+    mentions: [],
+    mentionAll: false,
+    // A wake is already inside the conversation the bot is part of; it does not
+    // need to earn its way past the group @-mention gate, and it never reaches
+    // it — `pending.push` is downstream of intake.
+    mentionedBot: true,
+    ...(route.threadId ? { threadId: route.threadId } : {}),
+    createTime: Date.now(),
+  } as NormalizedMessage;
+}
+
+/**
  * A synthetic user turn for a continuation round.
  *
  * Keeps the anchor's identity and routing (its `messageId` is what replies are
@@ -1111,6 +1208,7 @@ async function runAgentBatch(deps: RunBatchDeps): Promise<RoundOutcome> {
     lastRunModelByScope,
     scope,
     mode,
+    wake,
     goalMode,
   } = deps;
   if (batch.length === 0) return 'completed';
@@ -1120,6 +1218,18 @@ async function runAgentBatch(deps: RunBatchDeps): Promise<RoundOutcome> {
 
   const chatId = firstMsg.chatId;
   const threadId = firstMsg.threadId;
+
+  // Armed every run: the prefix a job is handed names *this* run, so its
+  // report threads back to this message and is attributed to this sender even
+  // if somebody else uses the chat while the job is still running.
+  const wakePrefix = await wake.arm({
+    scope,
+    chatId,
+    ...(threadId ? { threadId } : {}),
+    mode,
+    anchorId: firstMsg.messageId,
+    senderId: firstMsg.senderId,
+  });
 
   const resourceItems = batch.flatMap((m) =>
     m.resources.map((r) => ({ messageId: m.messageId, resource: r })),
@@ -1219,6 +1329,7 @@ async function runAgentBatch(deps: RunBatchDeps): Promise<RoundOutcome> {
     topicContext,
     channel.botIdentity,
     extraInstructions,
+    wakePrefix,
   );
   log.info('prompt', 'built', {
     promptChars: prompt.length,
@@ -2360,6 +2471,7 @@ function buildPrompt(
   topicContext: QuotedContext[] = [],
   botIdentity?: { openId: string; name?: string },
   extraInstructions?: string[],
+  wakePrefix?: string,
 ): string {
   const first = batch[0];
   if (!first) return '';
@@ -2396,6 +2508,7 @@ function buildPrompt(
       ...(botIdentity?.openId ? { botOpenId: botIdentity.openId } : {}),
       ...(mentions.length > 0 ? { mentions } : {}),
       ...(first.threadId ? { threadId: first.threadId } : {}),
+      ...(wakePrefix ? { wakePrefix } : {}),
       messageIds: batch.map((m) => m.messageId),
       source: 'im',
     },
