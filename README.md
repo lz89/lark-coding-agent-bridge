@@ -186,6 +186,30 @@ It stops on any of:
 
 Every ending posts why, and whether the goal was actually reached. A bridge restart kills the in-flight run, so the goal is parked rather than resumed silently: the chat gets a notice and `/goal resume` picks it back up from the round it reached.
 
+## Background callbacks (后台回执)
+
+`/goal` covers work the agent does itself, round after round. The other shape is a job that **outlives** the run: a build, an upload, a batch that takes twenty minutes. `nohup` keeps it alive, but the agent that started it is gone, and until now the only way that job could speak was to send a Feishu message — which, with the profile's `lark-cli` resolving to user identity, went out *as the user*.
+
+Every run's `bridge_context` now carries a `wakePrefix` path. A detached job writes one line under it:
+
+```bash
+nohup bash -c '
+  <the real command> > /tmp/job.log 2>&1
+  rc=$?
+  f=$(mktemp "<bridge_context.wakePrefix>.XXXXXX")
+  printf %s "done (exit=$rc); log at /tmp/job.log" > "$f"
+  mv "$f" "$f.wake"
+' >/dev/null 2>&1 &
+```
+
+The bridge sweeps for `*.wake` every 2s and does two things: posts the line into the chat **as the bot**, and hands it to the agent as a fresh turn on the same session. So the agent comes back with full context and finishes the job. `mktemp` + `mv` is not decoration — a fixed filename loses one of two concurrent reports, and writing `.wake` in place can be swept half-written.
+
+The prefix names the run that handed it out, so a report threads back to *its own* message and is attributed to whoever started it — a colleague using the same group meanwhile does not end up owning someone else's job. It is derived rather than allocated, so it survives restarts, and it is the same mechanism in a DM, a group, and a topic — no @-mention involved.
+
+Delivery is at-least-once: a report is removed only after it has been handed off, so a crash or a restart mid-delivery replays it rather than swallowing it. One written while the bridge was down is delivered on the next start (up to a day later). If the chat post itself fails, the agent is told so and puts the content in its own reply instead of acknowledging something nobody saw. A scope accepts 30 wakes an hour; past that the chat gets one throttle notice and the rest are dropped.
+
+Under a Codex `workspace-write` sandbox the inbox is passed as `--add-dir`, so a job can write it from outside the workspace. Under `read-only` nothing can be written at all, and the channel is unavailable along with everything else.
+
 ## Reply Display and COT
 
 `/config` controls three presentation settings:
