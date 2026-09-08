@@ -2214,7 +2214,7 @@ async function processAgentStream(
         recordSession(evt);
         // Ground truth for the footer: what the CLI actually loaded, which can
         // differ from what was requested (unknown id, account fallback).
-        if (evt.model) state = withMeta(state, { model: evt.model });
+        state = withMeta(state, { model: evt.model, effort: evt.effort });
         continue;
       }
       if (evt.type === 'usage') {
