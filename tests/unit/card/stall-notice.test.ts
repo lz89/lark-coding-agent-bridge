@@ -67,7 +67,16 @@ describe('stall notice', () => {
     };
 
     expect(card.config.streaming_mode).toBe(false);
-    expect(card.config.summary.content).toBe('工具卡死');
+    // No tool was outstanding, so don't blame one — the same watchdog also
+    // bounds a run that went silent without ever calling a tool.
+    expect(card.config.summary.content).toBe('无响应');
+  });
+
+  it('blames the tool only when one was actually outstanding', () => {
+    const withTool = renderCard(markStallTimeout(running, { minutes: 30, tool: 'Bash' })) as {
+      config: { summary: { content: string } };
+    };
+    expect(withTool.config.summary.content).toBe('工具卡死');
   });
 
   it('summarises a warned-but-running turn distinctly from a killed one', () => {

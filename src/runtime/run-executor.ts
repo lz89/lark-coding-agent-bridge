@@ -242,11 +242,24 @@ export class RunExecutor {
           graceMs: this.stopReapGraceMs,
           reason: 'event stream did not end after stop; releasing resources anyway',
         });
-        // Release the subscribers too. Without this, a caller awaiting the
-        // stream — `processAgentStream`, and therefore the reply that tells the
-        // user anything at all — stays parked on a source that will never
-        // produce again, and the card is never finalized.
+        // Release the subscribers. Without this, a caller awaiting the stream
+        // — `processAgentStream`, and therefore the reply that tells the user
+        // anything at all — stays parked on a source that will never produce
+        // again, and the card is never finalized.
         fanout.forceFinish();
+        // Then tear the source down for real. Waking subscribers alone leaves
+        // `pump()` parked on `source.next()`, still holding the run's event
+        // iterator and the child's stdout — and, if the child ignored the
+        // earlier SIGTERM, leaves it running as an orphan. `destroy()`
+        // SIGKILLs and closes the pipes so the iterator actually ends.
+        try {
+          run.destroy?.();
+        } catch (err) {
+          log.warn('run', 'stop-reap-destroy-failed', {
+            ...dimensions,
+            err: err instanceof Error ? err.message : String(err),
+          });
+        }
         void cleanup(false);
       }, this.stopReapGraceMs);
       // A pending reaper must never be the reason the process stays alive.
