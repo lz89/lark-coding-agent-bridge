@@ -17,6 +17,14 @@ export type AgentEvent =
       cachedInputTokens?: number;
       /** `cache_creation_input_tokens` — part of the prompt, so part of context. */
       cacheCreationInputTokens?: number;
+      /**
+       * Tokens that will be in context on the next turn. Computed by the
+       * adapter, because the arithmetic is provider-specific: Claude reports
+       * cached prompt tokens in buckets *separate* from `input_tokens`, while
+       * Codex/OpenAI report an `input_tokens` that already includes them.
+       * Summing the raw fields generically double-counts on one of the two.
+       */
+      contextTokens?: number;
       /** Model's context window, reported by the CLI. Used for the % on the footer. */
       contextWindow?: number;
       reasoningOutputTokens?: number;

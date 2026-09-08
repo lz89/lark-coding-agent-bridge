@@ -74,8 +74,17 @@ export function* translateEvent(raw: unknown): Generator<AgentEvent> {
 
   if (evt.type === 'result') {
     if (evt.usage) {
+      const u = evt.usage;
+      // Claude's `input_tokens` counts only the uncached remainder, so the
+      // whole prompt is the three buckets added together.
+      const contextTokens =
+        (u.input_tokens ?? 0) +
+        (u.cache_read_input_tokens ?? 0) +
+        (u.cache_creation_input_tokens ?? 0) +
+        (u.output_tokens ?? 0);
       yield {
         type: 'usage',
+        contextTokens: contextTokens > 0 ? contextTokens : undefined,
         inputTokens: evt.usage.input_tokens,
         outputTokens: evt.usage.output_tokens,
         cachedInputTokens: evt.usage.cache_read_input_tokens,

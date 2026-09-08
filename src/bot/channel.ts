@@ -1147,7 +1147,10 @@ async function runAgentBatch(deps: RunBatchDeps): Promise<void> {
           channel,
           chatId,
           scope,
-          state: finalAnswerOnlyState(finalState),
+          // Through `filterForPrefs` like every other reply path — it is what
+          // stamps the run footer's effort on, and a COT reply that silently
+          // dropped it was the one inconsistency between the modes.
+          state: finalAnswerOnlyState(filterForPrefs(finalState)),
           replyMode,
           sendOpts,
           cardRenderOptions,
@@ -1780,17 +1783,11 @@ async function processAgentStream(
           if (inputTokens !== undefined) reportMetric('tokens_in', inputTokens);
           if (outputTokens !== undefined) reportMetric('tokens_out', outputTokens);
         }
-        // Context going into the next turn = this turn's whole prompt (fresh +
-        // both cache tiers) plus what the model wrote. Billed tokens alone
-        // would read as though the conversation had barely grown once the
-        // cache is warm.
-        const contextTokens =
-          (evt.inputTokens ?? 0) +
-          (evt.cachedInputTokens ?? 0) +
-          (evt.cacheCreationInputTokens ?? 0) +
-          (evt.outputTokens ?? 0);
+        // Already summed by the adapter — the arithmetic is provider-specific
+        // (see `AgentEvent.usage.contextTokens`), so doing it here would apply
+        // Claude's token semantics to Codex's differently-shaped usage.
         state = withMeta(state, {
-          contextTokens: contextTokens > 0 ? contextTokens : undefined,
+          contextTokens: evt.contextTokens,
           contextWindow: evt.contextWindow,
         });
         continue;

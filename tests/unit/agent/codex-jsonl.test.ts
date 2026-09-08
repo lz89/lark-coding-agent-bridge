@@ -58,6 +58,10 @@ describe('Codex JSONL translator', () => {
     ).toEqual([
       { type: 'final_text', content: 'hello' },
       {
+        // Codex's `input_tokens` already contains the 5 cached tokens, so
+        // context is 12 + 34 — NOT the 51 the identical numbers produce on
+        // Claude. Summing the raw fields generically double-counts here.
+        contextTokens: 46,
         type: 'usage',
         inputTokens: 12,
         outputTokens: 34,
