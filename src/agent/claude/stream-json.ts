@@ -15,6 +15,14 @@ interface ContentBlock {
 interface ClaudeRawEvent {
   type?: string;
   subtype?: string;
+  /**
+   * On a `user` line: set when the CLI is replaying a message it received on
+   * stdin (`--replay-user-messages`). The replay happens at the point the
+   * message was incorporated into the turn, and `uuid` is whatever the writer
+   * put on the input line — the bridge's receipt for a steer.
+   */
+  isReplay?: boolean;
+  uuid?: string;
   session_id?: string;
   cwd?: string;
   model?: string;
@@ -71,6 +79,14 @@ export function* translateEvent(raw: unknown): Generator<AgentEvent> {
   }
 
   if (evt.type === 'user' && evt.message?.content) {
+    if (evt.isReplay === true && typeof evt.uuid === 'string' && evt.uuid) {
+      const text = evt.message.content
+        .filter((block) => block.type === 'text' && typeof block.text === 'string')
+        .map((block) => block.text as string)
+        .join('\n');
+      yield { type: 'user_input', uuid: evt.uuid, text };
+      return;
+    }
     for (const block of evt.message.content) {
       if (block.type === 'tool_result' && block.tool_use_id) {
         const output =
@@ -87,20 +103,41 @@ export function* translateEvent(raw: unknown): Generator<AgentEvent> {
   }
 
   if (evt.type === 'result') {
-    if (evt.usage) {
-      yield {
-        type: 'usage',
-        contextTokens: contextFromIterations(evt.usage.iterations),
-        inputTokens: evt.usage.input_tokens,
-        outputTokens: evt.usage.output_tokens,
-        cachedInputTokens: evt.usage.cache_read_input_tokens,
-        cacheCreationInputTokens: evt.usage.cache_creation_input_tokens,
-        contextWindow: soleContextWindow(evt.modelUsage),
-        costUsd: evt.total_cost_usd,
-      };
-    }
+    const usage = usageFromResult(raw);
+    if (usage) yield usage;
     yield { type: 'done', sessionId: evt.session_id, terminationReason: 'normal' };
   }
+}
+
+/**
+ * The `usage` event a `result` line carries, on its own.
+ *
+ * Split out of `translateEvent` because the adapter cannot let every `result`
+ * become `done`: a message handed to the turn via `send` can land in a *further*
+ * CLI turn, in which case the first result is a turn boundary and only the last
+ * one ends the run. The adapter decides which; this just reads the numbers.
+ */
+export function usageFromResult(raw: unknown): AgentEvent | undefined {
+  if (!raw || typeof raw !== 'object') return undefined;
+  const evt = raw as ClaudeRawEvent;
+  if (evt.type !== 'result' || !evt.usage) return undefined;
+  return {
+    type: 'usage',
+    contextTokens: contextFromIterations(evt.usage.iterations),
+    inputTokens: evt.usage.input_tokens,
+    outputTokens: evt.usage.output_tokens,
+    cachedInputTokens: evt.usage.cache_read_input_tokens,
+    cacheCreationInputTokens: evt.usage.cache_creation_input_tokens,
+    contextWindow: soleContextWindow(evt.modelUsage),
+    costUsd: evt.total_cost_usd,
+  };
+}
+
+/** The session id a `result` line names, for the terminal `done`. */
+export function sessionIdFromResult(raw: unknown): string | undefined {
+  if (!raw || typeof raw !== 'object') return undefined;
+  const evt = raw as ClaudeRawEvent;
+  return evt.type === 'result' ? evt.session_id : undefined;
 }
 
 /**

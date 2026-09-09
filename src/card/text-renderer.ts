@@ -2,6 +2,7 @@ import { maskEmails } from './mask-email';
 import { renderFooterMeta } from './run-footer';
 import type { Block, RunState, StallNotice, ToolEntry } from './run-state';
 import { toolHeaderText } from './tool-render';
+import { quoteUserInput } from './user-input';
 
 /**
  * Render `RunState` as plain markdown text — used in `messageReply: 'text'`
@@ -56,6 +57,9 @@ function renderBlock(block: Block): string {
   if (block.kind === 'text') {
     return block.content.trim();
   }
+  if (block.kind === 'user') {
+    return quoteUserInput(block.content.trim());
+  }
   return toolLine(block.tool);
 }
 
@@ -84,5 +88,18 @@ function footerLine(status: 'thinking' | 'tool_running' | 'streaming'): string {
  * turn with no answer goes out as a message containing only `🧠 …`.
  */
 export function hasDeliverableContent(state: RunState): boolean {
-  return renderText({ ...state, meta: undefined }).trim() !== '';
+  return renderText(withoutUserInput({ ...state, meta: undefined })).trim() !== '';
+}
+
+/**
+ * The state with the user's own mid-run messages removed.
+ *
+ * They are rendered so the reply reads in order, but they are not the agent
+ * answering: a turn that took in a correction and then said nothing has still
+ * said nothing, and must be treated that way by every emptiness check and by
+ * `/goal`'s "did the agent produce anything" test.
+ */
+export function withoutUserInput(state: RunState): RunState {
+  if (!state.blocks.some((b) => b.kind === 'user')) return state;
+  return { ...state, blocks: state.blocks.filter((b) => b.kind !== 'user') };
 }

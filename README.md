@@ -210,6 +210,26 @@ Delivery is at-least-once: a report is removed only after it has been handed off
 
 Under a Codex `workspace-write` sandbox the inbox is passed as `--add-dir`, so a job can write it from outside the workspace. Under `read-only` nothing can be written at all, and the channel is unavailable along with everything else.
 
+## Steering a run in flight
+
+A run used to be sealed the moment it started: a message sent while the agent was working waited in the queue until the run ended, then started a fresh one. Say "wait, the other file" thirty seconds into a five-minute task and the agent finished the wrong task first.
+
+Now a message that arrives mid-run is **handed to the running turn** (Claude Code profiles). The agent sees it at its next step — between two tool calls, typically within seconds — and adjusts, in the same run and the same context. On the reply it appears quoted at the point it was taken in, `💬` in front, so the transcript reads in order:
+
+```
+正在读取 config.ts…
+> 💬 [张林 (user)]: 等等，是 config.prod.ts
+好，换成 config.prod.ts。
+```
+
+Nothing about this is a new turn: the agent is told as much, and the footer, the goal round, the session are all still the run's own. Several messages inside one quiet window go in together, each tagged with its sender, since a mid-run message may well be someone else's.
+
+**What still waits for the next run**, in the order it arrived: anything carrying an attachment or a card (those need the full prompt path), the task a `/goal` command generates (it has to start its own driver), and anything sent after one of those — order across messages is kept even at the cost of a steer. Codex profiles cannot be steered at all (`codex exec` is one-shot) and keep the old serial behaviour throughout. There is a cap of 20 hand-overs per run and 4000 characters per hand-over; past either, messages simply wait.
+
+**Delivery is confirmed, not assumed.** The CLI replays each message at the moment it takes it in, and that replay is the bridge's receipt. A message the run ended without incorporating — the agent finished too fast, the process died, the pipe broke — is not lost: it is re-delivered as the next run, in its original position. `/stop` drops what was waiting, exactly as it always dropped the queue; what had already reached the agent stays with it.
+
+One thing steering deliberately does **not** do is reset the watchdogs. Your message reaching the agent proves nothing about the agent, so a stall warning already on screen stays there, and a run that was wedged is stopped on the same schedule whether or not you kept talking to it.
+
 ## Reply Display and COT
 
 `/config` controls three presentation settings:

@@ -2,6 +2,7 @@ import { deepMaskEmails } from './mask-email';
 import { renderFooterMeta } from './run-footer';
 import type { Block, FooterStatus, RunState, StallNotice, ToolEntry } from './run-state';
 import { toolBodyMd, toolHeaderText } from './tool-render';
+import { quoteUserInput } from './user-input';
 
 const REASONING_MAX = 1500;
 const COLLAPSE_TOOL_THRESHOLD = 3;
@@ -14,7 +15,11 @@ interface TextGroup {
   kind: 'text';
   content: string;
 }
-type Group = ToolGroup | TextGroup;
+interface UserGroup {
+  kind: 'user';
+  content: string;
+}
+type Group = ToolGroup | TextGroup | UserGroup;
 
 export interface RunCardRenderOptions {
   signCallback?: (action: string) => string;
@@ -32,6 +37,10 @@ export function renderCard(state: RunState, options: RunCardRenderOptions = {}):
       if (group.content.trim()) {
         elements.push(markdown(group.content));
       }
+    } else if (group.kind === 'user') {
+      // The user's own mid-run message, set apart so it never reads as the
+      // agent's words. Small type: it is context for what follows, not output.
+      elements.push(noteMd(quoteUserInput(group.content.trim())));
     } else {
       elements.push(...renderToolGroup(group.tools, state.terminal !== 'running'));
     }
@@ -88,11 +97,15 @@ function* groupBlocks(blocks: Block[]): Generator<Group> {
   for (const b of blocks) {
     if (b.kind === 'tool') {
       toolBuf.push(b.tool);
+      continue;
+    }
+    if (toolBuf.length > 0) {
+      yield { kind: 'tools', tools: toolBuf };
+      toolBuf = [];
+    }
+    if (b.kind === 'user') {
+      yield { kind: 'user', content: b.content };
     } else {
-      if (toolBuf.length > 0) {
-        yield { kind: 'tools', tools: toolBuf };
-        toolBuf = [];
-      }
       yield { kind: 'text', content: b.content };
     }
   }

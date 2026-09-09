@@ -277,6 +277,11 @@ export async function consumeCotEvents(
   try {
     for await (const evt of events) {
       if (evt.type === 'system' || evt.type === 'usage') continue;
+      // Steering bookkeeping, not agent output: the bridge renders the user's
+      // mid-run message on the reply itself, and the COT bubble is the agent's.
+      if (evt.type === 'user_input' || evt.type === 'input_dropped' || evt.type === 'turn_end') {
+        continue;
+      }
       if (evt.type === 'thinking') {
         closeTextIfNeeded();
         if (!reasoningOpen) {

@@ -54,8 +54,10 @@ describe('ClaudeAdapter system prompt wiring', () => {
 
     adapter.run({ runId: 'r1', prompt: 'hi', cwd: '/tmp' });
 
-    // The prompt goes via stdin, never argv (cmd.exe would mangle it on Windows).
-    expect(await readAll(child.stdin)).toBe('hi');
+    // The prompt goes via stdin, never argv (cmd.exe would mangle it on
+    // Windows) — as the first stream-json line, with stdin left open so the
+    // run can still be handed messages.
+    expect(promptText(await readFirstLine(child.stdin))).toBe('hi');
     expect(systemPromptFileContent()).toBe(
       buildBridgeSystemPrompt({ openId: 'ou_bot_self', name: 'Bridge' }),
     );
@@ -68,9 +70,21 @@ describe('ClaudeAdapter system prompt wiring', () => {
 
     adapter.run({ runId: 'r1', prompt: 'hi', cwd: '/tmp' });
 
-    expect(await readAll(child.stdin)).toBe('hi');
+    expect(promptText(await readFirstLine(child.stdin))).toBe('hi');
     expect(systemPromptFileContent()).toBe(buildBridgeSystemPrompt(undefined));
   });
+
+  function promptText(line: string): string {
+    const parsed = JSON.parse(line) as {
+      type: string;
+      uuid: string;
+      message: { role: string; content: Array<{ type: string; text: string }> };
+    };
+    expect(parsed.type).toBe('user');
+    expect(parsed.uuid).toMatch(/^[0-9a-f-]{36}$/);
+    expect(parsed.message.role).toBe('user');
+    return parsed.message.content.map((c) => c.text).join('');
+  }
 
   function systemPromptFileContent(): string {
     const args = spawnMock.spawnProcess.mock.calls[0]?.[1] as string[];
@@ -121,4 +135,15 @@ async function readAll(stream: PassThrough): Promise<string> {
     chunks.push(chunk as Buffer);
   }
   return Buffer.concat(chunks).toString('utf8');
+}
+
+/** The first newline-terminated line, without waiting for the stream to end. */
+async function readFirstLine(stream: PassThrough): Promise<string> {
+  let buffered = '';
+  for await (const chunk of stream) {
+    buffered += (chunk as Buffer).toString('utf8');
+    const nl = buffered.indexOf('\n');
+    if (nl !== -1) return buffered.slice(0, nl);
+  }
+  return buffered;
 }

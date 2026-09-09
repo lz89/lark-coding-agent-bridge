@@ -1,4 +1,5 @@
 import type { AgentRun } from '../agent/types';
+import { log } from '../core/logger';
 
 export interface RunHandle {
   run: AgentRun;
@@ -8,8 +9,19 @@ export interface RunHandle {
 export class ActiveRuns {
   private readonly handles = new Map<string, RunHandle>();
   private readonly reservations = new Set<string>();
+  private readonly interruptListeners: Array<(chatId: string) => void> = [];
   private pauseDepth = 0;
   private pauseReason: string | undefined;
+
+  /**
+   * Called at the instant a scope's run is interrupted, before the stop is
+   * issued. Every stop entry point — `/stop`, `/stop <scope>`, the card's stop
+   * button — lands in `interrupt`, so this is the one place a listener can be
+   * sure to see all of them.
+   */
+  onInterrupt(listener: (chatId: string) => void): void {
+    this.interruptListeners.push(listener);
+  }
 
   reserve(chatId: string): (() => void) | undefined {
     if (this.handles.has(chatId) || this.reservations.has(chatId)) return undefined;
@@ -77,6 +89,13 @@ export class ActiveRuns {
   interrupt(chatId: string): boolean {
     const h = this.handles.get(chatId);
     if (!h) return false;
+    for (const listener of this.interruptListeners) {
+      try {
+        listener(chatId);
+      } catch (err) {
+        log.warn('runs', 'interrupt-listener-failed', { chatId, err: String(err) });
+      }
+    }
     this.reservations.delete(chatId);
     h.interrupted = true;
     this.handles.delete(chatId);

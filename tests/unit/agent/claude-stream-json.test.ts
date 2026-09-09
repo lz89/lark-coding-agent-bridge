@@ -68,6 +68,37 @@ describe('Claude stream-json translator', () => {
     ]);
   });
 
+  it('translates a replayed user message into a receipt carrying its uuid', () => {
+    // `--replay-user-messages`: the CLI echoes a user line at the moment it
+    // takes it in, with whatever uuid the writer put on it. That echo is how
+    // the bridge learns a mid-run message reached the agent.
+    expect([
+      ...translateEvent({
+        type: 'user',
+        isReplay: true,
+        uuid: 'steer-1',
+        session_id: 'sess-1',
+        message: {
+          role: 'user',
+          content: [
+            { type: 'text', text: '改成蓝色' },
+            { type: 'text', text: '别动其它' },
+          ],
+        },
+      }),
+    ]).toEqual([{ type: 'user_input', uuid: 'steer-1', text: '改成蓝色\n别动其它' }]);
+  });
+
+  it('does not mistake a tool_result user line for a receipt', () => {
+    expect([
+      ...translateEvent({
+        type: 'user',
+        uuid: 'cli-generated',
+        message: { content: [{ type: 'tool_result', tool_use_id: 't', content: 'ok' }] },
+      }),
+    ]).toEqual([{ type: 'tool_result', id: 't', output: 'ok', isError: false }]);
+  });
+
   it('translates result usage before done', () => {
     expect([
       ...translateEvent({

@@ -36,7 +36,30 @@ export type AgentEvent =
       threadId?: string;
       terminationReason: 'normal' | 'interrupted' | 'timeout';
     }
-  | { type: 'error'; message: string; terminationReason: 'failed' | 'interrupted' | 'timeout' };
+  | { type: 'error'; message: string; terminationReason: 'failed' | 'interrupted' | 'timeout' }
+  /**
+   * A message handed to a running turn via {@link AgentRun.send} has been
+   * incorporated by the agent. Emitted when the CLI replays it, which happens
+   * at the agent-loop boundary where it was injected — not when it was
+   * written. Until this arrives the message is only *submitted*.
+   */
+  | { type: 'user_input'; uuid: string; text: string }
+  /**
+   * Messages that were submitted via `send` but never incorporated before the
+   * run ended. The bridge owns them and must deliver them some other way.
+   */
+  | { type: 'input_dropped'; uuids: string[] }
+  /**
+   * The CLI finished a turn but the run is not over: a submitted message had
+   * not been incorporated yet, so it will run as a further turn in the same
+   * process. Not a terminal — `done` only comes with the last turn.
+   */
+  | { type: 'turn_end' };
+
+/** Outcome of {@link AgentRun.send}. `ok` means submitted, not incorporated. */
+export type SendResult =
+  | { ok: true; uuid: string }
+  | { ok: false; reason: 'closed' | 'write-failed' };
 
 export const CLAUDE_DEFAULT_PERMISSION_MODE: ClaudePermissionMode = 'bypassPermissions';
 
@@ -86,6 +109,18 @@ export interface AgentRun {
    * waiting. Optional: adapters that own no OS resources can omit it.
    */
   destroy?(): void;
+  /**
+   * Hand a further user message to the turn that is already running, so the
+   * agent sees it at its next loop boundary instead of after the run ends.
+   *
+   * Returns `ok` when the message was *submitted*; incorporation is reported
+   * separately by a `user_input` event carrying the same uuid, and a message
+   * the run ended without incorporating comes back in `input_dropped`. Refused
+   * with `closed` once the run has stopped accepting input — after its last
+   * turn's result, on `stop()`, or when the pipe broke. Optional: adapters
+   * whose CLI is one-shot omit it, and callers fall back to queueing.
+   */
+  send?(text: string): SendResult;
 }
 
 /**

@@ -12,7 +12,14 @@ export interface ToolEntry {
 
 export type Block =
   | { kind: 'text'; content: string; streaming: boolean }
-  | { kind: 'tool'; tool: ToolEntry };
+  | { kind: 'tool'; tool: ToolEntry }
+  /**
+   * A message the user sent while the run was in flight, shown at the point
+   * the agent took it in. It is the user's words, not the agent's: renderers
+   * set it apart visually, and nothing that decides "did the agent answer"
+   * may count it — see `hasDeliverableContent`.
+   */
+  | { kind: 'user'; content: string; uuid: string };
 
 export type FooterStatus = 'thinking' | 'tool_running' | 'streaming' | null;
 export type Terminal =
@@ -136,6 +143,20 @@ export function reduce(state: RunState, evt: AgentEvent): RunState {
 
     case 'final_text':
       return { ...state, finalText: evt.content };
+
+    case 'user_input': {
+      // The agent has just read a mid-run message; whatever it was streaming
+      // is over and it is thinking about the new input.
+      return {
+        ...state,
+        blocks: [
+          ...closeStreamingText(state.blocks),
+          { kind: 'user', content: evt.text, uuid: evt.uuid },
+        ],
+        reasoning: { ...state.reasoning, active: false },
+        footer: 'thinking',
+      };
+    }
 
     case 'thinking': {
       return {

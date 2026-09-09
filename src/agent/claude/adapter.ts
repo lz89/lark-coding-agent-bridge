@@ -1,3 +1,4 @@
+import { randomUUID } from 'node:crypto';
 import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -15,8 +16,9 @@ import {
   type AgentEvent,
   type AgentRun,
   type AgentRunOptions,
+  type SendResult,
 } from '../types';
-import { translateEvent } from './stream-json';
+import { sessionIdFromResult, translateEvent, usageFromResult } from './stream-json';
 
 export interface ClaudeAdapterOptions {
   binary?: string;
@@ -74,6 +76,13 @@ export class ClaudeAdapter implements AgentAdapter {
       '-p',
       '--output-format',
       'stream-json',
+      // Input is stream-json too, and stdin stays open for the life of the
+      // turn: that is what lets a later message be handed to a run that is
+      // already working (`AgentRun.send`). Replay gives each such message a
+      // receipt — the CLI echoes it, uuid intact, at the point it took it in.
+      '--input-format',
+      'stream-json',
+      '--replay-user-messages',
       '--verbose',
       '--permission-mode',
       opts.permissionMode ?? CLAUDE_DEFAULT_PERMISSION_MODE,
@@ -91,6 +100,7 @@ export class ClaudeAdapter implements AgentAdapter {
       env: mergeProcessEnv(process.env, buildLarkChannelEnv(this.larkChannel)),
       stdio: ['pipe', 'pipe', 'pipe'],
     }) as ClaudeChild;
+    const input = new StdinInput(child.stdin);
 
     log.info('agent', 'spawn', {
       pid: child.pid ?? null,
@@ -131,12 +141,20 @@ export class ClaudeAdapter implements AgentAdapter {
     });
     child.on('exit', (code, signal) => {
       log.info('agent', 'exit', { pid: child.pid ?? null, code, signal });
+      input.markClosed();
       systemPromptFile.cleanup();
     });
     child.stdin.on('error', (err) => {
       log.warn('agent', 'stdin-error', { message: err.message });
+      // The pipe itself failed; do not try to end() it, just stop admitting.
+      input.markClosed();
     });
-    child.stdin.end(opts.prompt, 'utf8');
+    // The prompt is the first stream-json line. stdin is deliberately NOT
+    // ended here: the run may still be handed further messages. EOF is sent
+    // when the run stops taking input — see `StdinInput.close` — and the CLI
+    // then exits on its own after the turn, exactly as it did when the prompt
+    // and EOF arrived together.
+    input.writeInitial(opts.prompt);
 
     // Default 5s if caller didn't specify — claude often has live
     // subprocesses (lark-cli waiting for OAuth, long Bash, etc.) and the
@@ -147,8 +165,14 @@ export class ClaudeAdapter implements AgentAdapter {
 
     return {
       runId: opts.runId,
-      events: createEventStream(child, stderrChunks, () => runtimeError),
+      events: createEventStream(child, stderrChunks, () => runtimeError, input),
+      send: (text: string) => input.send(text),
       async stop() {
+        // Admission closes first, whatever the process state: nothing may be
+        // written into a run that is being stopped, and whatever was already
+        // written is reported dropped when the stream ends rather than left
+        // in limbo. EOF alone does not stop a turn, so the signal still follows.
+        input.close();
         if (child.exitCode !== null || child.signalCode !== null) return;
         log.info('agent', 'stop-sigterm', { pid: child.pid ?? null, graceMs: stopGraceMs });
         child.kill('SIGTERM');
@@ -171,6 +195,7 @@ export class ClaudeAdapter implements AgentAdapter {
         });
       },
       destroy(): void {
+        input.markClosed();
         // Order matters: kill first so nothing writes into a destroyed pipe,
         // then tear the pipes down so a readline iterator parked on stdout
         // ends instead of waiting on a descendant that inherited the fd.
@@ -213,6 +238,7 @@ async function* createEventStream(
   child: ClaudeChild,
   stderrChunks: Buffer[],
   getError: () => Error | null,
+  input: StdinInput,
 ): AsyncGenerator<AgentEvent> {
   // If fork itself failed synchronously, child.pid is undefined. The 'error'
   // event (ENOENT etc.) fires in the next tick, so also check getError().
@@ -235,6 +261,14 @@ async function* createEventStream(
     }, 50);
   };
   child.once('exit', closeSilentStdout);
+  // One logical run can span several CLI turns: a message handed over with
+  // `send` that the CLI did not fold into the running turn is run as the next
+  // one, in the same process. So a `result` line is only the end when nothing
+  // handed over is still waiting to be incorporated.
+  let terminalYielded = false;
+  // A result held back because a handed-over message was still outstanding.
+  // If the process then exits without running it, this becomes the terminal.
+  let heldTerminal: { sessionId: string | undefined } | undefined;
   try {
     for await (const line of rl) {
       sawStdout = true;
@@ -246,12 +280,59 @@ async function* createEventStream(
       } catch {
         continue;
       }
-      yield* translateEvent(parsed);
+      if ((parsed as { type?: unknown }).type === 'result') {
+        if (terminalYielded) {
+          log.warn('agent', 'result-after-done', { pid: child.pid ?? null });
+          continue;
+        }
+        const usage = usageFromResult(parsed);
+        const sessionId = sessionIdFromResult(parsed);
+        // No more input from here on, either way. EOF does not cancel a
+        // message already in the pipe (measured), so an outstanding one still
+        // runs — as a further turn, after which the process exits by itself.
+        input.close();
+        if (input.hasOutstanding()) {
+          heldTerminal = { sessionId };
+          if (usage) yield usage;
+          yield { type: 'turn_end' };
+          continue;
+        }
+        heldTerminal = undefined;
+        terminalYielded = true;
+        // Everything below `done` is unreachable once the consumer breaks on
+        // it, so anything that must be said about this run is said first.
+        const failed = input.takeFailed();
+        if (failed.length > 0) yield { type: 'input_dropped', uuids: failed };
+        if (usage) yield usage;
+        yield { type: 'done', sessionId, terminationReason: 'normal' };
+        continue;
+      }
+      for (const evt of translateEvent(parsed)) {
+        if (evt.type === 'user_input') {
+          // The prompt itself is replayed too; only a handed-over message is a
+          // receipt anyone is waiting for.
+          if (input.acknowledge(evt.uuid) === 'steer') yield evt;
+          continue;
+        }
+        yield evt;
+      }
     }
   } finally {
     if (silentExitTimer) clearTimeout(silentExitTimer);
     child.removeListener('exit', closeSilentStdout);
     rl.close();
+  }
+
+  // The stream is over. A handed-over message never incorporated is lost to
+  // this run; its owner gets it back to deliver some other way.
+  if (!terminalYielded) {
+    const dropped = input.takeOutstanding();
+    if (dropped.length > 0) yield { type: 'input_dropped', uuids: dropped };
+    if (heldTerminal) {
+      // The run's own turn finished normally; only the follow-on never ran.
+      terminalYielded = true;
+      yield { type: 'done', sessionId: heldTerminal.sessionId, terminationReason: 'normal' };
+    }
   }
 
   const earlyRuntimeError = getError();
@@ -290,6 +371,111 @@ async function* createEventStream(
       message: `claude runtime error: ${runtimeError.message}`,
       terminationReason: 'failed',
     };
+  }
+}
+
+/**
+ * The run's stdin, as a channel that stays open.
+ *
+ * Three facts measured against the real CLI shape everything here:
+ *  - a user line written while a turn is running is taken in at the agent's
+ *    next loop boundary (folded into the same turn), or — if the turn is past
+ *    that point — run as a further turn in the same process;
+ *  - EOF is "no more input", never "stop": a message already written is still
+ *    processed, and the process exits by itself once nothing is left;
+ *  - with `--replay-user-messages` the CLI echoes each user line, uuid intact,
+ *    at the moment it is incorporated. That echo is the receipt.
+ *
+ * So a message is *outstanding* from `send` until its echo. `close()` ends
+ * admission and sends EOF; whatever is outstanding at that point is either run
+ * by the CLI as its last turn, or comes back as dropped when the stream ends.
+ */
+class StdinInput {
+  private accepting = true;
+  private initialUuid: string | undefined;
+  /** uuid → text, for messages written but not yet echoed. */
+  private readonly outstanding = new Map<string, string>();
+  /** Messages whose write failed after `send` had already returned ok. */
+  private readonly failed = new Set<string>();
+
+  constructor(private readonly stdin: Writable) {}
+
+  writeInitial(prompt: string): void {
+    const uuid = randomUUID();
+    this.initialUuid = uuid;
+    this.write(uuid, prompt, (err) => {
+      if (err) log.warn('agent', 'prompt-write-failed', { message: err.message });
+    });
+  }
+
+  send(text: string): SendResult {
+    if (!this.accepting) return { ok: false, reason: 'closed' };
+    const uuid = randomUUID();
+    this.outstanding.set(uuid, text);
+    try {
+      // `write()`'s return value is backpressure, not failure — the bytes are
+      // admitted either way — so it is deliberately not consulted. A failure
+      // surfaces through the callback, after `send` has already returned.
+      this.write(uuid, text, (err) => {
+        if (!err) return;
+        log.warn('agent', 'steer-write-failed', { uuid, message: err.message });
+        if (this.outstanding.delete(uuid)) this.failed.add(uuid);
+      });
+    } catch (err) {
+      this.outstanding.delete(uuid);
+      log.warn('agent', 'steer-write-threw', { uuid, message: String(err) });
+      return { ok: false, reason: 'write-failed' };
+    }
+    return { ok: true, uuid };
+  }
+
+  /** Stop admitting and send EOF. Idempotent; safe to call mid-turn. */
+  close(): void {
+    if (!this.accepting) return;
+    this.accepting = false;
+    try {
+      this.stdin.end();
+    } catch {
+      // Pipe already gone — the desired state.
+    }
+  }
+
+  /** Stop admitting without touching a pipe that has already failed or closed. */
+  markClosed(): void {
+    this.accepting = false;
+  }
+
+  /** What a replayed uuid was: the prompt, a handed-over message, or neither. */
+  acknowledge(uuid: string): 'initial' | 'steer' | 'unknown' {
+    if (uuid === this.initialUuid) return 'initial';
+    return this.outstanding.delete(uuid) ? 'steer' : 'unknown';
+  }
+
+  hasOutstanding(): boolean {
+    return this.outstanding.size > 0;
+  }
+
+  takeFailed(): string[] {
+    const out = [...this.failed];
+    this.failed.clear();
+    return out;
+  }
+
+  /** Everything never incorporated, failed writes included. Clears both. */
+  takeOutstanding(): string[] {
+    const out = [...this.outstanding.keys(), ...this.failed];
+    this.outstanding.clear();
+    this.failed.clear();
+    return out;
+  }
+
+  private write(uuid: string, text: string, cb: (err?: Error | null) => void): void {
+    const line = `${JSON.stringify({
+      type: 'user',
+      uuid,
+      message: { role: 'user', content: [{ type: 'text', text }] },
+    })}\n`;
+    this.stdin.write(line, 'utf8', cb);
   }
 }
 

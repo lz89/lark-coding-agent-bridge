@@ -4,6 +4,7 @@ import type {
   NormalizedMessage,
 } from '@larksuite/channel';
 import { createLarkChannel } from '@larksuite/channel';
+import { rm } from 'node:fs/promises';
 import { dirname, join } from 'node:path';
 import { claudeCapability, codexCapability } from '../agent/capability';
 import {
@@ -14,6 +15,7 @@ import {
 } from '../agent/models';
 import {
   buildAgentPrompt,
+  promptSection,
   type BridgePromptInteractiveCard,
   type BridgePromptMention,
   type BridgePromptQuotedMessage,
@@ -39,7 +41,7 @@ import {
   type StallNotice,
   type Terminal,
 } from '../card/run-state';
-import { hasDeliverableContent, renderText } from '../card/text-renderer';
+import { hasDeliverableContent, renderText, withoutUserInput } from '../card/text-renderer';
 import { tryHandleCommand, type Controls } from '../commands';
 import type { AppConfig } from '../config/schema';
 import {
@@ -95,6 +97,7 @@ import { commandSessionCatalogIdentity } from './session-catalog-identity';
 import { startKeepalive } from './keepalive';
 import { PendingQueue } from './pending-queue';
 import { ProcessPool } from './process-pool';
+import { ScopeDispatcher } from './steering';
 import { fetchQuotedContext, fetchTopicContext, type QuotedContext } from './quote';
 import { lookupMessageThreadId } from './thread-id';
 import { addWorkingReaction, removeReaction } from './reaction';
@@ -323,15 +326,37 @@ export async function startChannel(deps: StartChannelDeps): Promise<BridgeChanne
   const channel = createLarkChannel(opts);
   const media = new MediaCache(channel, deps.appPaths?.mediaDir);
 
-  // Pending → run handoff: while a run is active on a chat, block its pending
-  // queue so messages keep accumulating without flushing. When the run ends,
-  // unblock arms a fresh quiet-window timer. Net effect: at most one run per
-  // chat in flight, and everything sent during a run merges into the next
-  // batch (only flushed once 600ms of silence has passed *after* the run).
+  // Pending → run handoff. A scope has at most one *driver* at a time, and the
+  // driver owns everything the scope admits until it returns: messages that
+  // arrive while a run is in flight are no longer held back until it ends —
+  // the debounce keeps firing, and each batch goes to the scope's dispatcher,
+  // which hands it to the running turn when the agent can take it and retains
+  // it for the next run when it cannot. Either way the batch has an owner from
+  // the moment the queue lets go of it; nothing is dropped and nothing starts
+  // a competing run.
+  const dispatchers = new Map<string, ScopeDispatcher>();
+  // Tasks a command generated (`/goal <目标>`) must start their own driver,
+  // so they are never steered into a run that is already going.
+  const nonSteerable = new WeakSet<NormalizedMessage>();
+  let shuttingDown = false;
+  // Every stop entry point lands here. A message waiting to be handed over is
+  // dropped the way `/stop` has always dropped the queue.
+  activeRuns.onInterrupt((scope) => dispatchers.get(scope)?.discard());
+
   const pending = new PendingQueue(DEBOUNCE_MS, (scope, batch) => {
     const firstMsg = batch[0];
     if (!firstMsg) return;
-    pending.block(scope);
+    const running = dispatchers.get(scope);
+    if (running) {
+      running.offer(batch);
+      return;
+    }
+    const dispatcher = new ScopeDispatcher({
+      scope,
+      isNonSteerable: (m) => nonSteerable.has(m),
+      prepare: (steerBatch, ctx) => buildSteerText(channel, steerBatch, ctx),
+    });
+    dispatchers.set(scope, dispatcher);
     void withTrace({ chatId: firstMsg.chatId }, async () => {
       log.info('flush', 'start', {
         scope,
@@ -373,11 +398,27 @@ export async function startChannel(deps: StartChannelDeps): Promise<BridgeChanne
           goals,
           pending,
           wake,
+          dispatcher,
         });
       } catch (err) {
         log.fail('flush', err);
       } finally {
-        pending.unblock(scope);
+        // Retire the dispatcher: no more steering, wait out any preparation
+        // still under way, then drain and hand off in one synchronous step so
+        // nothing can be offered to it in between and end up ownerless.
+        await dispatcher.settle();
+        const leftover = dispatcher.drain();
+        dispatchers.delete(scope);
+        if (leftover.length > 0) {
+          if (shuttingDown) {
+            log.info('flush', 'leftover-dropped-on-shutdown', { scope, count: leftover.length });
+          } else {
+            // Front of the queue: these were admitted before anything now
+            // waiting. The re-armed quiet window starts the next driver.
+            pending.prepend(scope, leftover);
+            log.info('flush', 'leftover-requeued', { scope, count: leftover.length });
+          }
+        }
         log.info('flush', 'end');
       }
     });
@@ -404,6 +445,8 @@ export async function startChannel(deps: StartChannelDeps): Promise<BridgeChanne
           executor,
           pool,
           goals,
+          dispatchers,
+          nonSteerable,
         }),
       ).catch((err) => log.fail('intake', err));
     },
@@ -593,6 +636,9 @@ export async function startChannel(deps: StartChannelDeps): Promise<BridgeChanne
   return {
     channel,
     disconnect: async () => {
+      // Before anything else: a driver finishing after this must not re-arm
+      // the queue against a channel that is going away.
+      shuttingDown = true;
       activeRuns.pauseNewRuns('bridge-disconnect');
       ownerRefresh.stop();
       knownChatsRefresh.stop();
@@ -719,6 +765,10 @@ interface IntakeDeps {
   executor: RunExecutor;
   pool: ProcessPool;
   goals: GoalController;
+  /** Live dispatchers by scope — a command that drops the queue drops theirs too. */
+  dispatchers: Map<string, ScopeDispatcher>;
+  /** Messages a command generated; marked so the dispatcher never steers them. */
+  nonSteerable: WeakSet<NormalizedMessage>;
 }
 
 type LogThreadModeOverride = (input: {
@@ -743,6 +793,8 @@ async function intakeMessage(deps: IntakeDeps): Promise<void> {
     executor,
     pool,
     goals,
+    dispatchers,
+    nonSteerable,
   } = deps;
   const preview = msg.content.length > 80 ? `${msg.content.slice(0, 80)}…` : msg.content;
   // Resolve scope (and underlying chat mode) once at intake — every
@@ -886,13 +938,23 @@ async function intakeMessage(deps: IntakeDeps): Promise<void> {
   });
   if (handled) {
     const dropped = keepPending ? [] : pending.cancel(scope);
+    // What a running scope's dispatcher is holding is queued too, just one
+    // step further along; a command that drops the queue drops it as well.
+    const retained = keepPending ? undefined : dispatchers.get(scope)?.discard();
     log.info('intake', 'command', {
       scope,
       droppedPending: dropped.length,
+      ...(retained ? { droppedRetained: retained.backlog, droppedInflight: retained.inflight } : {}),
       ...(keepPending ? { keptPending: true } : {}),
     });
     // Pushed after the cancel above, or it would be dropped as stale chatter.
-    if (queuedTask !== undefined) pending.push(scope, { ...emsg, content: queuedTask });
+    if (queuedTask !== undefined) {
+      const task: NormalizedMessage = { ...emsg, content: queuedTask };
+      // A task must start its own driver — for `/goal` that is what puts the
+      // round protocol in the prompt — so it is never handed to a run in flight.
+      nonSteerable.add(task);
+      pending.push(scope, task);
+    }
     return;
   }
 
@@ -917,6 +979,8 @@ interface RunBatchDeps {
   mode: ChatMode;
   /** 后台回执 inbox — re-armed each run so a wake routes to the live chat. */
   wake: WakeInbox;
+  /** Owner of every message this scope admits while the run is in flight. */
+  dispatcher: ScopeDispatcher;
   /** Set when this run is one round of a `/goal` continuation. */
   goalMode?: GoalRunContext;
 }
@@ -926,6 +990,12 @@ interface GoalRunContext {
   instruction: string;
   round: number;
   maxRounds: number;
+  /**
+   * This round's signal file. Cleared when a mid-run message pushes the round
+   * into a further CLI turn, so a `continue` the agent wrote before it saw the
+   * message cannot outlive a later decision to stop.
+   */
+  signalPath: string;
 }
 
 interface GoalDriveDeps extends Omit<RunBatchDeps, 'goalMode' | 'batch'> {
@@ -969,6 +1039,7 @@ async function driveScopeRun(deps: GoalDriveDeps): Promise<void> {
         await prepareGoalSignal(signalPath);
         goalMode = {
           round,
+          signalPath,
           maxRounds: state.maxRounds,
           instruction: goalProtocolInstruction({
             goal: state.goal,
@@ -1036,10 +1107,11 @@ async function driveScopeRun(deps: GoalDriveDeps): Promise<void> {
         return;
       }
 
-      // Anything the user said mid-round joins the next one instead of waiting
-      // for the whole goal to finish — otherwise a steer sent at round 3 of 20
-      // sits unread for hours.
-      const queued = pending.cancel(scope);
+      // Anything the user said mid-round that could not be handed to the
+      // round itself joins the next one instead of waiting for the whole goal
+      // to finish. Oldest first: what the dispatcher retained during the round
+      // arrived before anything still sitting in the debounce window.
+      const queued = [...deps.dispatcher.drain(), ...pending.cancel(scope)];
       if (queued.length > 0) {
         log.info('goal', 'merged-user-messages', { scope, count: queued.length });
       }
@@ -1209,6 +1281,7 @@ async function runAgentBatch(deps: RunBatchDeps): Promise<RoundOutcome> {
     scope,
     mode,
     wake,
+    dispatcher,
     goalMode,
   } = deps;
   if (batch.length === 0) return 'completed';
@@ -1408,6 +1481,27 @@ async function runAgentBatch(deps: RunBatchDeps): Promise<RoundOutcome> {
   activePolicyFingerprints.set(scope, flow.policy.policyFingerprint);
   const handle = execution.handle;
   const eventStream = execution.subscribe();
+  // From here the run can be handed further messages. Their receipts are read
+  // on a subscription of their own: the rendering consumer stops at the first
+  // terminal, an interrupt, or a render that throws, while the fanout keeps
+  // buffering — and a receipt buffered after that must still count, or a
+  // message the agent already acted on would be retried against the next run.
+  dispatcher.setActive({ run: handle.run, goalRound: goalMode !== undefined });
+  const ledger = consumeSteerReceipts(execution.subscribe(), {
+    dispatcher,
+    scope,
+    ...(goalMode
+      ? {
+          onTurnEnd: async () => {
+            // The round spilled into a further CLI turn on the strength of a
+            // mid-run message. Whatever the agent signalled before it read
+            // that message is void; the last turn decides.
+            await rm(goalMode.signalPath, { force: true });
+            log.info('goal', 'signal-cleared-on-turn-end', { scope, round: goalMode.round });
+          },
+        }
+      : {}),
+  });
   if (flow.resumeFrom) {
     log.info('session', 'resume', { sessionId: flow.resumeFrom, cwd });
   } else {
@@ -1793,10 +1887,51 @@ async function runAgentBatch(deps: RunBatchDeps): Promise<RoundOutcome> {
     // first means the agent finished and only the message was lost.
     return runReachedDone() ? 'delivery-failed' : 'run-failed';
   } finally {
+    // Nothing more may be handed to this run. Then settle the books: every
+    // receipt the fanout buffered is applied, and whatever is still in flight
+    // after that was never taken in and goes back to the dispatcher.
+    dispatcher.clearActive();
+    await ledger;
+    dispatcher.reconcileRunEnd();
     activePolicyFingerprints.delete(scope);
     scheduleWorkingReactionCleanup(channel, lastMsg.messageId, reactionPromise);
   }
   return outcome();
+}
+
+/**
+ * Apply steer receipts as they arrive, for the whole life of the stream.
+ *
+ * Kept apart from `processAgentStream` on purpose — that consumer exists to
+ * render, and it stops rendering at the first terminal, on an interrupt, and
+ * when a card update throws. Receipts do not stop mattering at any of those
+ * points: a `user_input` the agent incorporated a moment before an interrupt
+ * is a message it acted on, and must not be retried.
+ */
+async function consumeSteerReceipts(
+  events: AsyncIterable<AgentEvent>,
+  input: { dispatcher: ScopeDispatcher; scope: string; onTurnEnd?: () => Promise<void> },
+): Promise<void> {
+  try {
+    for await (const evt of events) {
+      if (evt.type === 'user_input') {
+        input.dispatcher.acknowledge(evt.uuid);
+      } else if (evt.type === 'input_dropped') {
+        input.dispatcher.dropped(evt.uuids);
+      } else if (evt.type === 'turn_end' && input.onTurnEnd) {
+        await input.onTurnEnd().catch((err) => {
+          log.warn('goal', 'signal-clear-failed', { scope: input.scope, err: String(err) });
+        });
+      }
+    }
+  } catch (err) {
+    // The fanout rethrows a source failure to every subscriber; the render
+    // path already reports it. What matters here is that the loop ended.
+    log.warn('steer', 'ledger-ended', {
+      scope: input.scope,
+      err: err instanceof Error ? err.message : String(err),
+    });
+  }
 }
 
 interface LazyProgressStream {
@@ -1872,7 +2007,9 @@ function createLazyProgressStream(
  */
 function shouldOpenProgressStream(state: RunState): boolean {
   if (state.terminal !== 'running') return false;
-  return renderText({ ...state, footer: null }).trim() !== '';
+  // The user's own mid-run message does not count either: a stream opened for
+  // it alone would be recalled as empty the moment the run ended.
+  return renderText(withoutUserInput({ ...state, footer: null })).trim() !== '';
 }
 
 /**
@@ -2184,6 +2321,20 @@ async function processAgentStream(
   try {
     for await (const evt of events) {
       if (handle.interrupted) break;
+
+      if (evt.type === 'user_input') {
+        // The user's message reached the agent. That proves nothing about the
+        // agent, so neither watchdog is touched, and a stall warning already
+        // on screen stays: the warning lives outside `state` (the watchdog
+        // only flushes it), so it is put back for this render.
+        const base = stallNotice && !stallFired ? markStalled(state, stallNotice) : state;
+        state = reduce(base, evt);
+        log.info('card', 'user-input', { scope, uuid: evt.uuid });
+        await flush(state);
+        continue;
+      }
+      // Steer bookkeeping, applied on its own subscription (`consumeSteerReceipts`).
+      if (evt.type === 'input_dropped' || evt.type === 'turn_end') continue;
 
       // Track tool flight before re-arming the idle timer so the arm step
       // sees the correct set size. tool_use opens a window; tool_result
@@ -2536,6 +2687,78 @@ function senderTypeOf(msg: NormalizedMessage): 'user' | 'bot' | undefined {
   if (senderType === 'user') return 'user';
   if (senderType === 'app' || senderType === 'bot') return 'bot';
   return undefined;
+}
+
+/**
+ * The text a batch becomes when handed to a turn that is already running.
+ *
+ * Not the full prompt — bridge_context, the instructions and the attachment
+ * policy were settled when the run started — but everything a late message
+ * needs to be understood on its own: who said it, which message ids it is,
+ * whom it mentions, and what it was replying to. Every message is
+ * sender-annotated, because a mid-run message is by definition separate from
+ * the one that started the run and may well be someone else's.
+ */
+async function buildSteerText(
+  channel: LarkChannel,
+  batch: NormalizedMessage[],
+  ctx: { goalRound: boolean },
+): Promise<string> {
+  const first = batch[0];
+  if (!first) return '';
+  const batchIds = new Set(batch.map((m) => m.messageId));
+  const quoteTargets = [
+    ...new Set(
+      batch
+        .map((m) => steerQuoteTarget(m))
+        .filter((id): id is string => Boolean(id) && !batchIds.has(id!)),
+    ),
+  ];
+  const quotes: BridgePromptQuotedMessage[] = [];
+  for (const targetId of quoteTargets) {
+    const q = await fetchQuotedContext(channel, targetId);
+    if (q) quotes.push(toPromptQuote(q));
+  }
+  const mentions = mergeMentions(batch);
+  const senderType = senderTypeOf(first);
+  const context = {
+    kind: 'mid-run',
+    messageIds: batch.map((m) => m.messageId),
+    senderId: first.senderId,
+    ...(first.senderName ? { senderName: first.senderName } : {}),
+    ...(senderType ? { senderType } : {}),
+    ...(mentions.length > 0 ? { mentions } : {}),
+  };
+  const text = batch.map((m) => `${senderAnnotation(m)} ${m.content.trim()}`).join('\n\n');
+  const notes = ['这是运行期间新到的消息，不是新的一轮：按它调整正在做的事，然后照常收尾。'];
+  if (ctx.goalRound) {
+    // Re-writing the signal is idempotent, so the safe instruction is the
+    // unconditional one — whatever was written before this message is void
+    // if the round spilled into a further turn, and harmless to repeat if not.
+    notes.push(
+      '闭环模式提示：处理完这条消息后，如果目标仍未闭环，请在本轮结束前重新写入信号文件（即使之前已经写过）。',
+    );
+  }
+  return [
+    promptSection('bridge_steer', context),
+    quotes.length > 0 ? promptSection('quoted_messages', quotes) : undefined,
+    promptSection('bridge_instructions', notes),
+    promptSection('user_input', { text }),
+  ]
+    .filter(Boolean)
+    .join('\n\n');
+}
+
+/**
+ * `replyQuoteTargetForMessage` without the chat mode, which the dispatcher
+ * does not have: a thread id on the message is treated as "topic", the same
+ * signal intake uses to override a lagging chat-mode cache.
+ */
+function steerQuoteTarget(msg: NormalizedMessage): string | undefined {
+  const replyTo = msg.replyToMessageId;
+  if (!replyTo) return undefined;
+  if (msg.threadId && msg.rootId && replyTo === msg.rootId) return undefined;
+  return replyTo;
 }
 
 function senderAnnotation(msg: NormalizedMessage): string {
