@@ -11,6 +11,24 @@ export interface ActiveRunInfo {
   run: SteerTarget;
   /** True during a `/goal` round — the steer then carries the signal-file note. */
   goalRound: boolean;
+  /**
+   * In a `/goal` round, each message handed over is issued a fresh signal
+   * path, and only the last one delivered counts at the end of the round: a
+   * `continue` the agent wrote before it read the message — or a late write
+   * from something it detached — cannot outlive its later decision.
+   */
+  steerSignal?: {
+    /** A new path for the message about to be handed over. */
+    issue(): string;
+    /** The message carrying `path` reached the agent's stdin. */
+    delivered(path: string): void;
+  };
+}
+
+export interface SteerContext {
+  goalRound: boolean;
+  /** The signal path this message tells the agent to write, in a goal round. */
+  signalPath?: string;
 }
 
 export interface ScopeDispatcherDeps {
@@ -21,13 +39,21 @@ export interface ScopeDispatcherDeps {
    * Build the text handed to the running agent. May fetch (quotes), may throw;
    * a throw leaves the batch retained for the next run.
    */
-  prepare: (batch: NormalizedMessage[], ctx: { goalRound: boolean }) => Promise<string>;
+  prepare: (batch: NormalizedMessage[], ctx: SteerContext) => Promise<string>;
   maxSteersPerRun?: number;
   maxSteerChars?: number;
 }
 
 export const DEFAULT_MAX_STEERS_PER_RUN = 20;
 export const DEFAULT_MAX_STEER_CHARS = 4_000;
+/**
+ * How long retirement waits for a preparation still under way. A quote fetch
+ * goes through the SDK's own request timeout, so this is a backstop, not the
+ * normal path — but a scope must never be wedged behind one hung fetch: past
+ * this, the dispatcher retires anyway and the late job finds itself retired
+ * and does nothing.
+ */
+export const DEFAULT_SETTLE_TIMEOUT_MS = 15_000;
 
 /** Message shapes whose whole meaning survives being passed as text. */
 const STEERABLE_CONTENT_TYPES = new Set(['text', 'post']);
@@ -236,12 +262,33 @@ export class ScopeDispatcher {
 
   /**
    * No further steering, ever, and every preparation already under way has
-   * finished (sent, or given up). After this `drain` is exact.
+   * finished (sent, or given up) — or the wait has run out. After this `drain`
+   * is exact: a job still running when the wait ran out sees `retired` after
+   * its await and leaves its batch where `drain` finds it.
    */
-  async settle(): Promise<void> {
+  async settle(opts: { timeoutMs?: number } = {}): Promise<void> {
     this.retired = true;
+    const timeoutMs = opts.timeoutMs ?? DEFAULT_SETTLE_TIMEOUT_MS;
+    const deadline = Date.now() + timeoutMs;
     while (this.preparing.size > 0) {
-      await Promise.allSettled([...this.preparing]);
+      const remaining = deadline - Date.now();
+      if (remaining <= 0) {
+        log.warn('steer', 'settle-timeout', {
+          scope: this.deps.scope,
+          preparing: this.preparing.size,
+          timeoutMs,
+        });
+        return;
+      }
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      const timeout = new Promise<void>((resolve) => {
+        timer = setTimeout(resolve, remaining);
+      });
+      try {
+        await Promise.race([Promise.allSettled([...this.preparing]), timeout]);
+      } finally {
+        if (timer) clearTimeout(timer);
+      }
     }
   }
 
@@ -255,9 +302,16 @@ export class ScopeDispatcher {
     generation: number,
     active: ActiveRunInfo & { steers: number },
   ): Promise<void> {
+    // Issued before preparation because the text carries it; only reported
+    // as delivered once the send succeeded, so a path the agent never saw
+    // cannot become the one the round is judged by.
+    const signalPath = active.steerSignal?.issue();
     let text: string;
     try {
-      text = await this.deps.prepare(batch, { goalRound: active.goalRound });
+      text = await this.deps.prepare(batch, {
+        goalRound: active.goalRound,
+        ...(signalPath ? { signalPath } : {}),
+      });
     } catch (err) {
       log.warn('steer', 'prepare-failed', { scope: this.deps.scope, seq, err: String(err) });
       return;
@@ -288,6 +342,7 @@ export class ScopeDispatcher {
     active.steers += 1;
     this.backlog.delete(seq);
     this.inflight.set(res.uuid, { seq, batch });
+    if (signalPath) active.steerSignal?.delivered(signalPath);
     log.info('steer', 'sent', {
       scope: this.deps.scope,
       seq,

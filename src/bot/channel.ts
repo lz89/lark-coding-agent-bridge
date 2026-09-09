@@ -97,7 +97,7 @@ import { commandSessionCatalogIdentity } from './session-catalog-identity';
 import { startKeepalive } from './keepalive';
 import { PendingQueue } from './pending-queue';
 import { ProcessPool } from './process-pool';
-import { ScopeDispatcher } from './steering';
+import { ScopeDispatcher, type SteerContext } from './steering';
 import { fetchQuotedContext, fetchTopicContext, type QuotedContext } from './quote';
 import { lookupMessageThreadId } from './thread-id';
 import { addWorkingReaction, removeReaction } from './reaction';
@@ -990,12 +990,14 @@ interface GoalRunContext {
   instruction: string;
   round: number;
   maxRounds: number;
-  /**
-   * This round's signal file. Cleared when a mid-run message pushes the round
-   * into a further CLI turn, so a `continue` the agent wrote before it saw the
-   * message cannot outlive a later decision to stop.
-   */
+  /** This round's signal file, as the round's prompt names it. */
   signalPath: string;
+  /**
+   * Each message handed to the round mid-run is told to write a *fresh* signal
+   * path, and the round is judged by the last one delivered. Called with each
+   * such path as it reaches the agent, so the driver knows which one that is.
+   */
+  onSteerSignalPath?: (path: string) => void;
 }
 
 interface GoalDriveDeps extends Omit<RunBatchDeps, 'goalMode' | 'batch'> {
@@ -1032,6 +1034,9 @@ async function driveScopeRun(deps: GoalDriveDeps): Promise<void> {
       const state = goals.get(scope);
       let goalMode: GoalRunContext | undefined;
       let signalPath: string | undefined;
+      // Signal paths handed to mid-run messages, in delivery order. The last
+      // one is the round's; anything written to an earlier one is void.
+      const steerSignalPaths: string[] = [];
       if (state) {
         goalId = state.id;
         round = state.round + 1;
@@ -1040,6 +1045,9 @@ async function driveScopeRun(deps: GoalDriveDeps): Promise<void> {
         goalMode = {
           round,
           signalPath,
+          onSteerSignalPath: (path) => {
+            steerSignalPaths.push(path);
+          },
           maxRounds: state.maxRounds,
           instruction: goalProtocolInstruction({
             goal: state.goal,
@@ -1055,7 +1063,22 @@ async function driveScopeRun(deps: GoalDriveDeps): Promise<void> {
       const outcome = await runAgentBatch({ ...deps, batch, ...(goalMode ? { goalMode } : {}) });
       if (!state || !signalPath) return;
 
-      const signal = await readGoalSignal(signalPath);
+      // A mid-run message re-issues the signal path; only the last one the
+      // agent was told about decides the round. Earlier files — a `continue`
+      // written before the agent read the message, or a late write from
+      // something it detached — are removed unread.
+      const effectiveSignalPath = steerSignalPaths.at(-1) ?? signalPath;
+      for (const stale of [signalPath, ...steerSignalPaths]) {
+        if (stale !== effectiveSignalPath) await rm(stale, { force: true }).catch(() => {});
+      }
+      if (effectiveSignalPath !== signalPath) {
+        log.info('goal', 'signal-path-superseded', {
+          scope,
+          round,
+          steers: steerSignalPaths.length,
+        });
+      }
+      const signal = await readGoalSignal(effectiveSignalPath);
       const endRound = (stop: 'done' | 'run-failed' | 'silent'): Promise<void> | undefined => {
         // `expectId` guards the window where `/goal off` during this round was
         // followed by a new goal: without it this round would close that one.
@@ -1486,22 +1509,20 @@ async function runAgentBatch(deps: RunBatchDeps): Promise<RoundOutcome> {
   // terminal, an interrupt, or a render that throws, while the fanout keeps
   // buffering — and a receipt buffered after that must still count, or a
   // message the agent already acted on would be retried against the next run.
-  dispatcher.setActive({ run: handle.run, goalRound: goalMode !== undefined });
-  const ledger = consumeSteerReceipts(execution.subscribe(), {
-    dispatcher,
-    scope,
+  let steerSignals = 0;
+  dispatcher.setActive({
+    run: handle.run,
+    goalRound: goalMode !== undefined,
     ...(goalMode
       ? {
-          onTurnEnd: async () => {
-            // The round spilled into a further CLI turn on the strength of a
-            // mid-run message. Whatever the agent signalled before it read
-            // that message is void; the last turn decides.
-            await rm(goalMode.signalPath, { force: true });
-            log.info('goal', 'signal-cleared-on-turn-end', { scope, round: goalMode.round });
+          steerSignal: {
+            issue: () => `${goalMode.signalPath}.steer${++steerSignals}`,
+            delivered: (path) => goalMode.onSteerSignalPath?.(path),
           },
         }
       : {}),
   });
+  const ledger = consumeSteerReceipts(execution.subscribe(), { dispatcher, scope });
   if (flow.resumeFrom) {
     log.info('session', 'resume', { sessionId: flow.resumeFrom, cwd });
   } else {
@@ -1910,7 +1931,7 @@ async function runAgentBatch(deps: RunBatchDeps): Promise<RoundOutcome> {
  */
 async function consumeSteerReceipts(
   events: AsyncIterable<AgentEvent>,
-  input: { dispatcher: ScopeDispatcher; scope: string; onTurnEnd?: () => Promise<void> },
+  input: { dispatcher: ScopeDispatcher; scope: string },
 ): Promise<void> {
   try {
     for await (const evt of events) {
@@ -1918,10 +1939,8 @@ async function consumeSteerReceipts(
         input.dispatcher.acknowledge(evt.uuid);
       } else if (evt.type === 'input_dropped') {
         input.dispatcher.dropped(evt.uuids);
-      } else if (evt.type === 'turn_end' && input.onTurnEnd) {
-        await input.onTurnEnd().catch((err) => {
-          log.warn('goal', 'signal-clear-failed', { scope: input.scope, err: String(err) });
-        });
+      } else if (evt.type === 'turn_end') {
+        log.info('steer', 'turn-end', { scope: input.scope });
       }
     }
   } catch (err) {
@@ -2702,7 +2721,7 @@ function senderTypeOf(msg: NormalizedMessage): 'user' | 'bot' | undefined {
 async function buildSteerText(
   channel: LarkChannel,
   batch: NormalizedMessage[],
-  ctx: { goalRound: boolean },
+  ctx: SteerContext,
 ): Promise<string> {
   const first = batch[0];
   if (!first) return '';
@@ -2732,11 +2751,14 @@ async function buildSteerText(
   const text = batch.map((m) => `${senderAnnotation(m)} ${m.content.trim()}`).join('\n\n');
   const notes = ['这是运行期间新到的消息，不是新的一轮：按它调整正在做的事，然后照常收尾。'];
   if (ctx.goalRound) {
-    // Re-writing the signal is idempotent, so the safe instruction is the
-    // unconditional one — whatever was written before this message is void
-    // if the round spilled into a further turn, and harmless to repeat if not.
+    // The round is now judged by this path alone. Anything written to the
+    // earlier one — before the agent read this message, or by something it
+    // detached — is void, so the instruction is unconditional: write here or
+    // the round ends.
     notes.push(
-      '闭环模式提示：处理完这条消息后，如果目标仍未闭环，请在本轮结束前重新写入信号文件（即使之前已经写过）。',
+      ctx.signalPath
+        ? `闭环模式提示：本轮的信号文件路径已更换，之前写过的一律作废。处理完这条消息后，如果目标仍未闭环，请在本轮结束前把下一步写进这个新路径：echo '<下一步要做什么,一句话>' > "${ctx.signalPath}"`
+        : '闭环模式提示：处理完这条消息后，如果目标仍未闭环，请在本轮结束前重新写入信号文件（即使之前已经写过）。',
     );
   }
   return [

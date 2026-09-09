@@ -423,6 +423,29 @@ describe('ClaudeAdapter steering', () => {
     await iterator.return?.();
   });
 
+  it('refuses a message once the CLI has closed its end of stdin', async () => {
+    const fake = await createFakeClaude({
+      // The turn keeps going after stdin is closed from the CLI side.
+      turns: [[text('busy'), { __closeStdin: true }, { __awaitEvent: 'never' }]],
+      closeStdinInsteadOfWaiting: true,
+    });
+    cleanup.push(fake.dir);
+    const run = new ClaudeAdapter({ binary: fake.path }).run({
+      runId: 'run-stdin-closed',
+      prompt: 'start',
+      cwd: fake.dir,
+    });
+    const iterator = run.events[Symbol.asyncIterator]();
+    expect((await iterator.next()).value).toEqual({ type: 'text', delta: 'busy' });
+    // Give the close a moment to propagate through the pipe.
+    for (let i = 0; i < 50 && run.send!('probe').ok; i++) {
+      await new Promise((resolve) => setTimeout(resolve, 20));
+    }
+    expect(run.send!('after close')).toEqual({ ok: false, reason: 'closed' });
+    run.destroy?.();
+    await iterator.return?.();
+  });
+
   it('destroy() closes admission too', async () => {
     const fake = await createFakeClaude({
       turns: [[text('busy'), { __awaitInput: true }, { type: 'result', session_id: 'sess-1' }]],
@@ -491,6 +514,8 @@ async function createFakeClaude(options: {
   exitDelayMs?: number;
   /** Exit as soon as the scripts are done instead of waiting for EOF. */
   exitAfterTurns?: boolean;
+  /** Do not exit on EOF (used with a `__closeStdin` script that closes it itself). */
+  closeStdinInsteadOfWaiting?: boolean;
 }): Promise<FakeBinary> {
   const dir = await mkdtemp(join(tmpdir(), 'claude-adapter-test-'));
   const path = join(dir, 'fake-claude.mjs');
@@ -508,6 +533,7 @@ async function createFakeClaude(options: {
       'const replay = argv.includes("--replay-user-messages");',
       `const turns = ${JSON.stringify(turns)};`,
       `const exitAfterTurns = ${options.exitAfterTurns ? 'true' : 'false'};`,
+      `const ignoreEof = ${options.closeStdinInsteadOfWaiting ? 'true' : 'false'};`,
       'const inputs = [];',
       'let turnIdx = 0;',
       'let waiting = null;',
@@ -525,6 +551,8 @@ async function createFakeClaude(options: {
       '      echo(next);',
       '      continue;',
       '    }',
+      '    if (line && line.__closeStdin) { process.stdin.destroy(); continue; }',
+      '    if (line && line.__awaitEvent === "never") { await new Promise(() => {}); }',
       '    emit(line);',
       '  }',
       '}',
@@ -564,7 +592,8 @@ async function createFakeClaude(options: {
       '    if (exitAfterTurns && turnIdx >= turns.length) finish();',
       '  });',
       '});',
-      'rl.on("close", () => { chain.then(finish); });',
+      'rl.on("close", () => { if (!ignoreEof) chain.then(finish); });',
+      'process.on("SIGTERM", () => process.exit(143));',
     ]
       .filter(Boolean)
       .join('\n'),

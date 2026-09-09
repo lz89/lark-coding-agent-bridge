@@ -263,16 +263,34 @@ describe('steering: a message that arrives mid-run', () => {
 
     await sendMidRun(h, message('om_2', '只发一次'));
     const steer = h.agent.sends[0]!;
-    // Interrupt first: the render loop stops on the next event, but the
-    // receipt buffered behind it must still be applied.
-    await h.channel.handlers.message?.(message('om_3', '/stop'));
-    await settle();
+    // Kill the render loop without touching the dispatcher: the next card
+    // update throws, the stream is abandoned, and everything after that is
+    // seen only by the receipt ledger.
+    h.channel.failCardUpdatesFrom = h.channel.cardUpdates.length + 1;
+    await emit(h, { type: 'text', delta: '这条会让渲染失败' });
     await emit(h, { type: 'user_input', uuid: steer.uuid, text: '[User (user)]: 只发一次' });
     await finishRun(h);
     await vi.advanceTimersByTimeAsync(DEBOUNCE_MS * 2);
     await settle();
 
     expect(h.agent.runOptions).toHaveLength(1);
+  });
+
+  it('without that receipt, the same render failure leads to re-delivery', async () => {
+    const h = await createHarness();
+    await startTestBridge(h);
+    vi.useFakeTimers();
+
+    await startRun(h, message('om_1', 'go'));
+    await emit(h, { type: 'text', delta: '…' });
+
+    await sendMidRun(h, message('om_2', '要重发的'));
+    h.channel.failCardUpdatesFrom = h.channel.cardUpdates.length + 1;
+    await emit(h, { type: 'text', delta: '这条会让渲染失败' });
+    await finishRun(h);
+
+    await waitForRun(h, 2);
+    expect(h.agent.runOptions[1]!.prompt).toContain('要重发的');
   });
 
   it('falls back to the old serial behaviour for an agent that cannot be steered', async () => {
@@ -327,7 +345,7 @@ describe('steering: a message that arrives mid-run', () => {
     expect(JSON.stringify(h.channel.sent)).not.toContain('算了');
   });
 
-  it('in a /goal round the steer restates the signal rule, and a spill voids the old signal', async () => {
+  it('in a /goal round the steer hands out a fresh signal path, and only that one counts', async () => {
     const h = await createHarness();
     await startTestBridge(h);
     vi.useFakeTimers();
@@ -337,21 +355,57 @@ describe('steering: a message that arrives mid-run', () => {
     expect(prompt).toContain('闭环模式(第 1/');
     // Every prompt section is JSON-encoded, so the path arrives with escaped
     // quotes around it — match the path itself.
-    const signalPath = /([^\s"\\]+\.continue)/.exec(prompt)?.[1];
-    expect(signalPath).toBeTruthy();
+    const roundPath = /([^\s"\\]+\.continue)/.exec(prompt)?.[1];
+    expect(roundPath).toBeTruthy();
     await emit(h, { type: 'text', delta: '…' });
 
     await sendMidRun(h, message('om_2', '先别管 flaky 的'));
     expect(h.agent.sends).toHaveLength(1);
-    expect(h.agent.sends[0]!.text).toContain('闭环模式提示');
+    const steer = h.agent.sends[0]!;
+    expect(steer.text).toContain('闭环模式提示');
+    const steerPath = /([^\s"\\]+\.continue\.steer1)/.exec(steer.text)?.[1];
+    expect(steerPath).toBe(`${roundPath}.steer1`);
+    await emit(h, { type: 'user_input', uuid: steer.uuid, text: '[User (user)]: 先别管 flaky 的' });
 
-    // The agent had already asked to continue, then read the message and the
-    // round spilled into a further turn: that earlier request is void.
-    await writeFile(signalPath!, '继续修 flaky');
-    expect(existsSync(signalPath!)).toBe(true);
-    await emit(h, { type: 'turn_end' });
-    for (let i = 0; i < 50 && existsSync(signalPath!); i++) await settle();
-    expect(existsSync(signalPath!)).toBe(false);
+    // The agent asked to continue on the round's original path — before it
+    // read the message, or from something it detached that wrote late. Only
+    // the path the message named decides the round; that one was left empty.
+    await writeFile(roundPath!, '继续修 flaky');
+    await finishRun(h);
+    // The verdict comes after the stale file is removed and the effective one
+    // read — real file I/O, so yield until the notice has gone out.
+    const goalClosed = (): boolean =>
+      h.channel.sent.some((s) => JSON.stringify(s.content).includes('闭环模式结束'));
+    for (let i = 0; i < 200 && !goalClosed(); i++) await settle();
+
+    expect(existsSync(roundPath!)).toBe(false);
+    expect(existsSync(steerPath!)).toBe(false);
+    // The goal closed instead of running a round on the stale reason.
+    expect(goalClosed()).toBe(true);
+    await vi.advanceTimersByTimeAsync(DEBOUNCE_MS * 2);
+    await settle();
+    expect(h.agent.runOptions).toHaveLength(1);
+  });
+
+  it('in a /goal round, a continue written to the path the steer named is honoured', async () => {
+    const h = await createHarness();
+    await startTestBridge(h);
+    vi.useFakeTimers();
+
+    await startRun(h, message('om_1', '/goal 修好所有测试'));
+    await emit(h, { type: 'text', delta: '…' });
+    await sendMidRun(h, message('om_2', '先别管 flaky 的'));
+    const steer = h.agent.sends[0]!;
+    const steerPath = /([^\s"\\]+\.continue\.steer1)/.exec(steer.text)?.[1];
+    expect(steerPath).toBeTruthy();
+    await emit(h, { type: 'user_input', uuid: steer.uuid, text: '[User (user)]: 先别管 flaky 的' });
+
+    await writeFile(steerPath!, '接着修剩下的');
+    await finishRun(h);
+
+    await waitForRun(h, 2);
+    expect(h.agent.runOptions[1]!.prompt).toContain('闭环续跑 · 第 2 轮');
+    expect(h.agent.runOptions[1]!.prompt).toContain('接着修剩下的');
   });
 });
 
@@ -528,6 +582,8 @@ async function startTestBridge(h: {
 
 interface FakeLarkChannel {
   botIdentity: { openId: string; name: string };
+  /** Make streaming card updates throw from the Nth call on. */
+  failCardUpdatesFrom?: number;
   handlers: MessageHandlerMap;
   sent: Array<{ chatId: string; content: unknown }>;
   cardUpdates: unknown[];
@@ -548,7 +604,8 @@ function createFakeLarkChannel(): FakeLarkChannel {
   const handlers: MessageHandlerMap = {};
   const sent: FakeLarkChannel['sent'] = [];
   const cardUpdates: unknown[] = [];
-  return {
+  let updateCalls = 0;
+  const self: FakeLarkChannel = {
     handlers,
     sent,
     cardUpdates,
@@ -596,6 +653,10 @@ function createFakeLarkChannel(): FakeLarkChannel {
       if (typeof cardInput?.card?.producer === 'function') {
         await cardInput.card.producer({
           async update(card) {
+            updateCalls += 1;
+            if (self.failCardUpdatesFrom !== undefined && updateCalls >= self.failCardUpdatesFrom) {
+              throw new Error('card update rejected by Feishu (simulated 400)');
+            }
             cardUpdates.push(card);
           },
         });
@@ -607,6 +668,7 @@ function createFakeLarkChannel(): FakeLarkChannel {
     },
     async removeReaction() {},
   };
+  return self;
 }
 
 function createControls(profileConfig: ReturnType<typeof createDefaultProfileConfig>) {

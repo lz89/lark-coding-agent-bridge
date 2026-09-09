@@ -149,6 +149,9 @@ export class ClaudeAdapter implements AgentAdapter {
       // The pipe itself failed; do not try to end() it, just stop admitting.
       input.markClosed();
     });
+    // The CLI can close its end while the process lives on; from then on a
+    // write would only fail later, so refuse it now instead.
+    child.stdin.on('close', () => input.markClosed());
     // The prompt is the first stream-json line. stdin is deliberately NOT
     // ended here: the run may still be handed further messages. EOF is sent
     // when the run stops taking input — see `StdinInput.close` — and the CLI

@@ -1,10 +1,11 @@
 import type { NormalizedMessage } from '@larksuite/channel';
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import type { SendResult } from '../../../src/agent/types.js';
 import {
   DEFAULT_MAX_STEERS_PER_RUN,
   ScopeDispatcher,
   isSteerableBatch,
+  type SteerContext,
 } from '../../../src/bot/steering.js';
 
 function msg(id: string, content: string, extra: Partial<NormalizedMessage> = {}): NormalizedMessage {
@@ -55,7 +56,7 @@ const tick = async (): Promise<void> => {
 };
 
 function dispatcher(
-  prepare: (batch: NormalizedMessage[], ctx: { goalRound: boolean }) => Promise<string> = async (b) =>
+  prepare: (batch: NormalizedMessage[], ctx: SteerContext) => Promise<string> = async (b) =>
     b.map((m) => m.content).join('\n'),
   extra: Partial<ConstructorParameters<typeof ScopeDispatcher>[0]> = {},
 ): ScopeDispatcher {
@@ -333,6 +334,75 @@ describe('ScopeDispatcher', () => {
     d.offer([msg('1', 'x')]);
     await tick();
     expect(seen).toEqual([true]);
+  });
+
+  function signalTracker() {
+    const issued: string[] = [];
+    const delivered: string[] = [];
+    let n = 0;
+    return {
+      issued,
+      delivered,
+      steerSignal: {
+        issue: () => {
+          const p = `/g/round.steer${++n}`;
+          issued.push(p);
+          return p;
+        },
+        delivered: (p: string) => delivered.push(p),
+      },
+    };
+  }
+
+  it('issues a fresh goal signal path per hand-over, and the text carries it', async () => {
+    const seen: Array<string | undefined> = [];
+    const d = dispatcher(async (b, ctx) => {
+      seen.push(ctx.signalPath);
+      return b[0]!.content;
+    });
+    const t = signalTracker();
+    d.setActive({ run: fakeRun().run, goalRound: true, steerSignal: t.steerSignal });
+    d.offer([msg('1', 'a')]);
+    await tick();
+    d.offer([msg('2', 'b')]);
+    await tick();
+    expect(seen).toEqual(['/g/round.steer1', '/g/round.steer2']);
+    expect(t.delivered).toEqual(['/g/round.steer1', '/g/round.steer2']);
+  });
+
+  it('a path issued to a message that never reached the agent is not reported delivered', async () => {
+    const d = dispatcher();
+    const t = signalTracker();
+    d.setActive({ run: fakeRun({ accept: false }).run, goalRound: true, steerSignal: t.steerSignal });
+    d.offer([msg('1', 'refused')]);
+    await tick();
+    expect(t.issued).toEqual(['/g/round.steer1']);
+    expect(t.delivered).toEqual([]);
+  });
+
+  it('settle gives up on a preparation that never finishes, without losing the batch', async () => {
+    vi.useFakeTimers();
+    try {
+      const d = dispatcher(() => new Promise<string>(() => {}));
+      const { run, sent } = fakeRun();
+      d.setActive({ run, goalRound: false });
+      d.offer([msg('1', 'stuck')]);
+      await tick();
+
+      let settled = false;
+      const settling = d.settle({ timeoutMs: 1_000 }).then(() => {
+        settled = true;
+      });
+      await vi.advanceTimersByTimeAsync(999);
+      expect(settled).toBe(false);
+      await vi.advanceTimersByTimeAsync(2);
+      await settling;
+      expect(settled).toBe(true);
+      expect(sent).toEqual([]);
+      expect(d.drain().map((m) => m.messageId)).toEqual(['1']);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it('ignores receipts and drops for uuids it does not know', () => {
