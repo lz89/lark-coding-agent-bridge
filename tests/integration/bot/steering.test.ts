@@ -842,6 +842,53 @@ describe('the receipt: a reaction the moment a message is accepted', () => {
     expect(JSON.stringify(h.channel.sent)).toContain('lcb-receipt-test');
   });
 
+  it('comes off a message whose agent never ran: a run exists, but only reports a failed spawn', async () => {
+    const h = await createHarness();
+    await startTestBridge(h);
+    vi.useFakeTimers();
+
+    await startRun(h, message('om_1', 'go'));
+    expect(marks(h)).toEqual(['om_1:Get']);
+    expect(withdrawn(h)).toEqual([]);
+
+    // What the adapter yields when the binary is gone: no init, no output.
+    await emit(h, {
+      type: 'error',
+      message: 'failed to spawn claude: ENOENT',
+      terminationReason: 'failed',
+    });
+    for (let i = 0; i < 200 && h.channel.withdrawn.length === 0; i++) {
+      await vi.advanceTimersByTimeAsync(20);
+      await settle();
+    }
+    expect(withdrawn(h)).toEqual(['om_1:Get']);
+  });
+
+  it('stays on a message the agent did run on, however the run ended', async () => {
+    const h = await createHarness();
+    await startTestBridge(h);
+    vi.useFakeTimers();
+
+    await startRun(h, message('om_1', 'go'));
+    await emit(h, { type: 'system', sessionId: 's1' });
+    await emit(h, { type: 'error', message: 'claude crashed', terminationReason: 'failed' });
+    await vi.advanceTimersByTimeAsync(DEBOUNCE_MS * 3);
+    await settle();
+    expect(withdrawn(h)).toEqual([]);
+
+    // Second scope, stopped by the user after the agent had begun.
+    await h.channel.handlers.message?.(message('om_2', 'go', { chatId: 'oc_other' }));
+    await vi.advanceTimersByTimeAsync(DEBOUNCE_MS + 50);
+    await waitForRun(h, 2);
+    await emit(h, { type: 'text', delta: '…' });
+    await h.channel.handlers.message?.(message('om_3', '/stop', { chatId: 'oc_other' }));
+    await settle();
+    await vi.advanceTimersByTimeAsync(DEBOUNCE_MS * 3);
+    await settle();
+    expect(withdrawn(h)).toEqual([]);
+    expect(marks(h)).toEqual(['om_1:Get', 'om_2:Get']);
+  });
+
   it('can be turned off, or set to another sticker', async () => {
     const off = await createHarness({ ackReaction: false });
     await startTestBridge(off);

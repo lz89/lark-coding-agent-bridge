@@ -1056,37 +1056,37 @@ async function driveScopeRun(deps: GoalDriveDeps): Promise<void> {
       // Signal paths handed to mid-run messages, in delivery order. The last
       // one is the round's; anything written to an earlier one is void.
       const steerSignalPaths: string[] = [];
-      if (state) {
-        goalId = state.id;
-        round = state.round + 1;
-        signalPath = goals.signalPath(state.id, round);
-        await prepareGoalSignal(signalPath);
-        goalMode = {
-          round,
-          signalPath,
-          onSteerSignalPath: (path) => {
-            steerSignalPaths.push(path);
-          },
-          maxRounds: state.maxRounds,
-          instruction: goalProtocolInstruction({
-            goal: state.goal,
-            round,
-            maxRounds: state.maxRounds,
-            signalPath,
-            deadlineAt: state.deadlineAt,
-            now: Date.now(),
-          }),
-        };
-      }
-
       let outcome: RoundOutcome;
       try {
+        if (state) {
+          goalId = state.id;
+          round = state.round + 1;
+          signalPath = goals.signalPath(state.id, round);
+          await prepareGoalSignal(signalPath);
+          goalMode = {
+            round,
+            signalPath,
+            onSteerSignalPath: (path) => {
+              steerSignalPaths.push(path);
+            },
+            maxRounds: state.maxRounds,
+            instruction: goalProtocolInstruction({
+              goal: state.goal,
+              round,
+              maxRounds: state.maxRounds,
+              signalPath,
+              deadlineAt: state.deadlineAt,
+              now: Date.now(),
+            }),
+          };
+        }
         outcome = await runAgentBatch({ ...deps, batch, ...(goalMode ? { goalMode } : {}) });
       } catch (err) {
-        // Nothing retries a batch its round threw on. Unless the agent had
-        // been started on it — then it was handled and its marks are kept —
-        // the receipts on it come off: a wake that failed to arm, an
-        // attachment that would not download, a spawn that failed.
+        // Nothing retries a batch its round threw on — the round's signal
+        // file that could not be prepared, a wake that failed to arm, an
+        // attachment that would not download, a spawn that failed. Unless
+        // the agent had taken the batch by then (its marks are kept as soon
+        // as it has), the receipts on it come off.
         deps.acks.withdraw(batch);
         throw err;
       }
@@ -1535,9 +1535,6 @@ async function runAgentBatch(deps: RunBatchDeps): Promise<RoundOutcome> {
   }
 
   const { execution, cwdRealpath: cwd } = flow;
-  // The batch reached the agent: its receipts are facts now, whatever the run
-  // goes on to do — a throw or a drop past this point is not a lost message.
-  deps.acks.keep(deps.batch);
   activePolicyFingerprints.set(scope, flow.policy.policyFingerprint);
   const handle = execution.handle;
   const eventStream = execution.subscribe();
@@ -1559,7 +1556,19 @@ async function runAgentBatch(deps: RunBatchDeps): Promise<RoundOutcome> {
         }
       : {}),
   });
-  const ledger = consumeSteerReceipts(execution.subscribe(), { dispatcher, scope });
+  // A run exists, but that is not yet the agent having the batch: a spawn
+  // that failed (the binary gone since startup) reports through the stream,
+  // not by throwing. The receipts become facts at the agent's first sign of
+  // life, and come off in the `finally` below if the run ends without one.
+  let agentTookBatch = false;
+  const ledger = consumeSteerReceipts(execution.subscribe(), {
+    dispatcher,
+    scope,
+    onAgentAlive: () => {
+      agentTookBatch = true;
+      deps.acks.keep(deps.batch);
+    },
+  });
   // The receipt's own text is the envelope the agent was handed; the reply
   // shows the user's words instead.
   const steerDisplay = (uuid: string): string | undefined => dispatcher.displayFor(uuid);
@@ -1957,6 +1966,9 @@ async function runAgentBatch(deps: RunBatchDeps): Promise<RoundOutcome> {
     // after that was never taken in and goes back to the dispatcher.
     dispatcher.clearActive();
     await ledger;
+    // The run ended without the agent ever running: nothing retries the
+    // batch, and the receipts on it say it was taken. They come off.
+    if (!agentTookBatch) deps.acks.withdraw(deps.batch);
     dispatcher.reconcileRunEnd();
     activePolicyFingerprints.delete(scope);
     scheduleWorkingReactionCleanup(channel, lastMsg.messageId, reactionPromise);
@@ -1973,12 +1985,36 @@ async function runAgentBatch(deps: RunBatchDeps): Promise<RoundOutcome> {
  * points: a `user_input` the agent incorporated a moment before an interrupt
  * is a message it acted on, and must not be retried.
  */
+/**
+ * Whether an event is the agent running, as opposed to failing to. A spawn
+ * that failed yields `error` and nothing else; a run the agent never got to
+ * yields `input_dropped` for what it was handed, or a `done` that was not
+ * its own (interrupted, timed out) before any output. Everything else — the
+ * init line, text, a tool call, a receipt, a turn ending normally — is the
+ * agent at work on the batch.
+ */
+function isAgentAlive(evt: AgentEvent): boolean {
+  if (evt.type === 'error' || evt.type === 'input_dropped') return false;
+  if (evt.type === 'done') return evt.terminationReason === 'normal';
+  return true;
+}
+
 async function consumeSteerReceipts(
   events: AsyncIterable<AgentEvent>,
-  input: { dispatcher: ScopeDispatcher; scope: string },
+  input: {
+    dispatcher: ScopeDispatcher;
+    scope: string;
+    /** Called once, at the first event that is the agent running rather than failing to. */
+    onAgentAlive?: () => void;
+  },
 ): Promise<void> {
+  let alive = false;
   try {
     for await (const evt of events) {
+      if (!alive && isAgentAlive(evt)) {
+        alive = true;
+        input.onAgentAlive?.();
+      }
       if (evt.type === 'user_input') {
         input.dispatcher.acknowledge(evt.uuid);
       } else if (evt.type === 'input_dropped') {
