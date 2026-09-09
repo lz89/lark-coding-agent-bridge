@@ -45,6 +45,7 @@ import { hasDeliverableContent, renderText, withoutUserInput } from '../card/tex
 import { tryHandleCommand, type Controls } from '../commands';
 import type { AppConfig } from '../config/schema';
 import {
+  getAckReaction,
   getAgentStopGraceMs,
   getCotMessages,
   getGoalMaxHours,
@@ -100,7 +101,7 @@ import { ProcessPool } from './process-pool';
 import { ScopeDispatcher, type PreparedSteer, type SteerContext } from './steering';
 import { fetchQuotedContext, fetchTopicContext, type QuotedContext } from './quote';
 import { lookupMessageThreadId } from './thread-id';
-import { addWorkingReaction, removeReaction } from './reaction';
+import { addWorkingReaction, ReceiptAcks, removeReaction } from './reaction';
 import { fetchKnownChats } from './lark-info';
 import type { AppPaths } from '../config/app-paths';
 import {
@@ -338,6 +339,9 @@ export async function startChannel(deps: StartChannelDeps): Promise<BridgeChanne
   // Tasks a command generated (`/goal <目标>`) must start their own driver,
   // so they are never steered into a run that is already going.
   const nonSteerable = new WeakSet<NormalizedMessage>();
+  // The receipt on each accepted message; taken back from any the bridge
+  // lets go unhandled. Read per message so a `/config` change applies live.
+  const acks = new ReceiptAcks(channel, () => getAckReaction(controls.cfg));
   let shuttingDown = false;
   // Every stop entry point lands here. A message waiting to be handed over is
   // dropped the way `/stop` has always dropped the queue.
@@ -355,6 +359,7 @@ export async function startChannel(deps: StartChannelDeps): Promise<BridgeChanne
       scope,
       isNonSteerable: (m) => nonSteerable.has(m),
       prepare: (steerBatch, ctx) => buildSteerText(channel, steerBatch, ctx),
+      onLost: (lost) => acks.withdraw(lost),
     });
     dispatchers.set(scope, dispatcher);
     void withTrace({ chatId: firstMsg.chatId }, async () => {
@@ -399,6 +404,7 @@ export async function startChannel(deps: StartChannelDeps): Promise<BridgeChanne
           pending,
           wake,
           dispatcher,
+          acks,
         });
       } catch (err) {
         log.fail('flush', err);
@@ -447,6 +453,7 @@ export async function startChannel(deps: StartChannelDeps): Promise<BridgeChanne
           goals,
           dispatchers,
           nonSteerable,
+          acks,
         }),
       ).catch((err) => log.fail('intake', err));
     },
@@ -769,6 +776,8 @@ interface IntakeDeps {
   dispatchers: Map<string, ScopeDispatcher>;
   /** Messages a command generated; marked so the dispatcher never steers them. */
   nonSteerable: WeakSet<NormalizedMessage>;
+  /** The receipt each accepted message gets, and loses if it is dropped. */
+  acks: ReceiptAcks;
 }
 
 type LogThreadModeOverride = (input: {
@@ -795,6 +804,7 @@ async function intakeMessage(deps: IntakeDeps): Promise<void> {
     goals,
     dispatchers,
     nonSteerable,
+    acks,
   } = deps;
   const preview = msg.content.length > 80 ? `${msg.content.slice(0, 80)}…` : msg.content;
   // Resolve scope (and underlying chat mode) once at intake — every
@@ -941,6 +951,9 @@ async function intakeMessage(deps: IntakeDeps): Promise<void> {
     // What a running scope's dispatcher is holding is queued too, just one
     // step further along; a command that drops the queue drops it as well.
     const retained = keepPending ? undefined : dispatchers.get(scope)?.discard();
+    // What the queue let go was never handled; its receipt says otherwise.
+    // (The dispatcher reports its own losses through `onLost`.)
+    acks.withdraw(dropped);
     log.info('intake', 'command', {
       scope,
       droppedPending: dropped.length,
@@ -959,6 +972,9 @@ async function intakeMessage(deps: IntakeDeps): Promise<void> {
   }
 
   const size = pending.push(scope, emsg);
+  // Received, and in the bridge's hands: say so on the message itself, now —
+  // whether it starts a run, waits behind one, or is handed to one in flight.
+  acks.acknowledge(emsg);
   log.info('intake', 'queued', { scope, queueSize: size, debounceMs: DEBOUNCE_MS });
 }
 
@@ -981,6 +997,8 @@ interface RunBatchDeps {
   wake: WakeInbox;
   /** Owner of every message this scope admits while the run is in flight. */
   dispatcher: ScopeDispatcher;
+  /** The receipt each message carries; taken back from a batch that never runs. */
+  acks: ReceiptAcks;
   /** Set when this run is one round of a `/goal` continuation. */
   goalMode?: GoalRunContext;
 }
@@ -1497,6 +1515,8 @@ async function runAgentBatch(deps: RunBatchDeps): Promise<RoundOutcome> {
     });
     await channel.send(chatId, { markdown: flow.rejectReason.userVisible }, sendOpts);
     // The agent never started — an unusable cwd, a full pool, a denied policy.
+    // The batch is not retried, so the receipts on it come off.
+    deps.acks.withdraw(deps.batch);
     // The reason went to the user already, but for a goal this is emphatically
     // not "round finished": calling it completed would close the goal as
     // achieved on a round that never ran.

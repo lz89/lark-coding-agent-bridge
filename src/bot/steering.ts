@@ -48,6 +48,13 @@ export interface ScopeDispatcherDeps {
    * a throw leaves the batch retained for the next run.
    */
   prepare: (batch: NormalizedMessage[], ctx: SteerContext) => Promise<PreparedSteer>;
+  /**
+   * Messages this dispatcher let go without any run handling them: what a
+   * `discard` found waiting, and what the agent never took in after one.
+   * Told once per message, oldest first, so a receipt shown for it can be
+   * taken back.
+   */
+  onLost?: (messages: NormalizedMessage[]) => void;
   maxSteersPerRun?: number;
   maxSteerChars?: number;
 }
@@ -250,6 +257,7 @@ export class ScopeDispatcher {
 
   /** The run ended without taking these in: back to the backlog, at their seq. */
   dropped(uuids: readonly string[]): void {
+    const lost: NormalizedMessage[] = [];
     for (const uuid of uuids) {
       const entry = this.inflight.get(uuid);
       if (!entry) continue;
@@ -258,11 +266,13 @@ export class ScopeDispatcher {
         // Dropped by the queue in the meantime; a message that never reached
         // the agent and was told to go away is not re-delivered.
         log.info('steer', 'dropped-discarded', { scope: this.deps.scope, uuid, seq: entry.seq });
+        lost.push(...entry.batch);
         continue;
       }
       this.backlog.set(entry.seq, entry.batch);
       log.info('steer', 'dropped', { scope: this.deps.scope, uuid, seq: entry.seq });
     }
+    if (lost.length > 0) this.deps.onLost?.(lost);
   }
 
   /**
@@ -286,11 +296,12 @@ export class ScopeDispatcher {
   discard(): { backlog: number; inflight: number } {
     const counts = { backlog: this.backlog.size, inflight: this.inflight.size };
     this.generation += 1;
-    this.backlog.clear();
+    const lost = this.drain();
     for (const entry of this.inflight.values()) entry.discarded = true;
     if (counts.backlog > 0 || counts.inflight > 0) {
       log.info('steer', 'discarded', { scope: this.deps.scope, ...counts });
     }
+    if (lost.length > 0) this.deps.onLost?.(lost);
     return counts;
   }
 

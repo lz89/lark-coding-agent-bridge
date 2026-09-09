@@ -108,6 +108,17 @@ export interface AppPreferences {
    */
   showToolCalls?: boolean;
   /**
+   * The reaction the bot puts on every message it takes on — the one that
+   * starts a run, one queued behind a run, one handed to a run in flight —
+   * the moment it is accepted. A Feishu reaction `emoji_type` (`'Get'` is
+   * the 收到 / GET sticker, the default; `'OK'`, `'THUMBSUP'`, … also work).
+   * `false` or `'off'` turns it off. Taken back should the bridge let the
+   * message go unhandled (`/stop`, a queue-dropping command, a run that could
+   * not start), so a mark that stays means the message reached the agent or
+   * still will.
+   */
+  ackReaction?: string | false;
+  /**
    * Model the underlying agent runs with, forwarded as `--model`. The catalog
    * of valid values is agent-kind specific — see `agent/models.ts`. `undefined`
    * or the `'default'` sentinel means "don't pass `--model`" so the agent
@@ -250,6 +261,24 @@ export function getMessageReplyMode(cfg: AppConfig): MessageReplyMode {
 /** Resolve the show-tool-calls preference with default fallback. */
 export function getShowToolCalls(cfg: AppConfig): boolean {
   return cfg.preferences?.showToolCalls !== false;
+}
+
+/** The receipt reaction a fresh config uses: Feishu's 收到 / GET sticker. */
+export const DEFAULT_ACK_REACTION = 'Get';
+
+/**
+ * Resolve the receipt-reaction preference: the `emoji_type` to put on each
+ * accepted message, or `undefined` when the receipt is off. Unset means the
+ * default; `false`, `'off'` and an empty string mean off; any other string is
+ * taken as the emoji type, trimmed.
+ */
+export function getAckReaction(cfg: AppConfig): string | undefined {
+  const raw = cfg.preferences?.ackReaction;
+  if (raw === false) return undefined;
+  if (typeof raw !== 'string') return DEFAULT_ACK_REACTION;
+  const emoji = raw.trim();
+  if (emoji === '' || emoji.toLowerCase() === 'off') return undefined;
+  return emoji;
 }
 
 export function getCotMessages(cfg: AppConfig): CotMessagesMode {

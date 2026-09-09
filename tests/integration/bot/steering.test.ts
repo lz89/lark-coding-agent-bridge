@@ -623,19 +623,28 @@ interface FakeLarkChannel {
   send(chatId: string, content: unknown, options?: unknown): Promise<{ messageId: string }>;
   stream(chatId: string, input: unknown, options?: unknown): Promise<void>;
   recallMessage(messageId: string): Promise<void>;
+  /** Reactions put on messages, in order (the receipt marks). */
+  reactions: Array<{ messageId: string; emojiType: string }>;
+  /** Reactions taken back by emoji, in order. */
+  withdrawn: Array<{ messageId: string; emojiType: string }>;
   addReaction(messageId: string, emojiType: string): Promise<string>;
   removeReaction(messageId: string, reactionId: string): Promise<void>;
+  removeReactionByEmoji(messageId: string, emojiType: string): Promise<boolean>;
 }
 
 function createFakeLarkChannel(): FakeLarkChannel {
   const handlers: MessageHandlerMap = {};
   const sent: FakeLarkChannel['sent'] = [];
   const cardUpdates: unknown[] = [];
+  const reactions: FakeLarkChannel['reactions'] = [];
+  const withdrawn: FakeLarkChannel['withdrawn'] = [];
   let updateCalls = 0;
   const self: FakeLarkChannel = {
     handlers,
     sent,
     cardUpdates,
+    reactions,
+    withdrawn,
     botIdentity: { openId: 'ou_bot', name: 'Bridge' },
     rawClient: {
       request: vi.fn(async () => ({ data: { items: [] } })),
@@ -690,10 +699,15 @@ function createFakeLarkChannel(): FakeLarkChannel {
       }
     },
     async recallMessage() {},
-    async addReaction() {
-      return 'r1';
+    async addReaction(messageId, emojiType) {
+      reactions.push({ messageId, emojiType });
+      return `r${reactions.length}`;
     },
     async removeReaction() {},
+    async removeReactionByEmoji(messageId, emojiType) {
+      withdrawn.push({ messageId, emojiType });
+      return true;
+    },
   };
   return self;
 }
@@ -732,3 +746,98 @@ function message(
     ...extra,
   } as unknown as NormalizedMessage;
 }
+
+describe('the receipt: a reaction the moment a message is accepted', () => {
+  const marks = (h: Harness) => h.channel.reactions.map((r) => `${r.messageId}:${r.emojiType}`);
+  const withdrawn = (h: Harness) => h.channel.withdrawn.map((r) => `${r.messageId}:${r.emojiType}`);
+
+  it('goes on every accepted message at intake — trigger and mid-run alike — never on a command', async () => {
+    const h = await createHarness();
+    await startTestBridge(h);
+    vi.useFakeTimers();
+
+    // Accepted: marked before the quiet window has even elapsed.
+    await h.channel.handlers.message?.(message('om_1', 'go'));
+    expect(marks(h)).toEqual(['om_1:Get']);
+    await vi.advanceTimersByTimeAsync(DEBOUNCE_MS + 50);
+    await waitForRun(h, 1);
+    await emit(h, { type: 'text', delta: '…' });
+
+    // A follow-up handed to the running turn: marked at intake, well before
+    // the agent's receipt — and the mark stays once it is taken in.
+    await sendMidRun(h, message('om_2', '改成蓝色'));
+    expect(marks(h)).toEqual(['om_1:Get', 'om_2:Get']);
+    const steer = h.agent.sends[0]!;
+    await emit(h, { type: 'user_input', uuid: steer.uuid, text: steer.text });
+
+    // A command answers for itself; and dropping the queue does not touch a
+    // message that is already in the agent.
+    await h.channel.handlers.message?.(message('om_3', '/help'));
+    await settle();
+    expect(marks(h)).toEqual(['om_1:Get', 'om_2:Get']);
+
+    await finishRun(h);
+    expect(withdrawn(h)).toEqual([]);
+  });
+
+  it('is taken back from what /stop drops: the quiet window, and what was held for the next run', async () => {
+    const h = await createHarness({}, { steerable: false });
+    await startTestBridge(h);
+    vi.useFakeTimers();
+
+    await startRun(h, message('om_1', 'go'));
+    await emit(h, { type: 'text', delta: '…' });
+    // Cannot be steered (a Codex-style run): held for the next run.
+    await sendMidRun(h, message('om_2', '排队的'));
+    // Still inside its quiet window.
+    await h.channel.handlers.message?.(message('om_3', '还在防抖里'));
+    expect(marks(h)).toEqual(['om_1:Get', 'om_2:Get', 'om_3:Get']);
+
+    await h.channel.handlers.message?.(message('om_4', '/stop'));
+    await settle();
+    await vi.advanceTimersByTimeAsync(DEBOUNCE_MS * 3);
+    await settle();
+
+    // The trigger was handled (and stopped): its mark stays.
+    expect([...withdrawn(h)].sort()).toEqual(['om_2:Get', 'om_3:Get']);
+    expect(h.agent.runOptions).toHaveLength(1);
+  });
+
+  it('is taken back from a mid-run message the agent never took in before /stop ended the run', async () => {
+    const h = await createHarness();
+    await startTestBridge(h);
+    vi.useFakeTimers();
+
+    await startRun(h, message('om_1', 'go'));
+    await emit(h, { type: 'text', delta: '…' });
+    await sendMidRun(h, message('om_2', '改成蓝色'));
+    expect(h.agent.sends).toHaveLength(1);
+
+    // No receipt for it yet when the run is stopped: it is not re-delivered,
+    // so it was not handled — and the mark says so.
+    await h.channel.handlers.message?.(message('om_3', '/stop'));
+    await settle();
+    await vi.advanceTimersByTimeAsync(DEBOUNCE_MS * 3);
+    await settle();
+    expect(withdrawn(h)).toEqual(['om_2:Get']);
+    expect(h.agent.runOptions).toHaveLength(1);
+  });
+
+  it('can be turned off, or set to another sticker', async () => {
+    const off = await createHarness({ ackReaction: false });
+    await startTestBridge(off);
+    vi.useFakeTimers();
+    await startRun(off, message('om_1', 'go'));
+    expect(off.channel.reactions).toEqual([]);
+    await finishRun(off);
+    vi.useRealTimers();
+    await Promise.all(cleanups.splice(0).map((cleanup) => cleanup()));
+    sdkMock.channel = undefined;
+
+    const ok = await createHarness({ ackReaction: 'OK' });
+    await startTestBridge(ok);
+    vi.useFakeTimers();
+    await ok.channel.handlers.message?.(message('om_1', 'go'));
+    expect(marks(ok)).toEqual(['om_1:OK']);
+  });
+});

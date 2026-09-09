@@ -24,6 +24,7 @@ import {
   type MutableProfileState,
 } from '../config/config-ops';
 import {
+  getAckReaction,
   getCotMessages,
   getMaxConcurrentRuns,
   getMessageReplyMode,
@@ -58,6 +59,8 @@ export interface ConfigView {
   models: { value: string; label: string }[];
   messageReply: MessageReplyMode;
   showToolCalls: boolean;
+  /** Receipt reaction on each accepted message (`emoji_type`); `false` = off. */
+  ackReaction: string | false;
   cotMessages: CotMessagesMode;
   maxConcurrentRuns: number;
   runIdleTimeoutMinutes: number;
@@ -87,6 +90,7 @@ export function buildConfigView(state: MutableProfileState, live = false): Confi
     models: supportedModels(agentKind),
     messageReply: getMessageReplyMode(state.cfg),
     showToolCalls: getShowToolCalls(state.cfg),
+    ackReaction: getAckReaction(state.cfg) ?? false,
     cotMessages: getCotMessages(state.cfg),
     maxConcurrentRuns: getMaxConcurrentRuns(state.cfg),
     runIdleTimeoutMinutes: ms ? Math.round(ms / 60_000) : 0,
@@ -225,6 +229,12 @@ function parseConfigBody(state: MutableProfileState, body: unknown): ParsedConfi
       : getMessageReplyMode(state.cfg);
   const showToolCalls =
     typeof fv.showToolCalls === 'boolean' ? fv.showToolCalls : getShowToolCalls(state.cfg);
+  const ackReaction: string | false =
+    fv.ackReaction === false
+      ? false
+      : typeof fv.ackReaction === 'string' && fv.ackReaction.trim() !== ''
+        ? fv.ackReaction.trim()
+        : (getAckReaction(state.cfg) ?? false);
   const cotMessages: CotMessagesMode =
     fv.cotMessages === 'brief' || fv.cotMessages === 'detailed' || fv.cotMessages === 'off'
       ? fv.cotMessages
@@ -269,6 +279,7 @@ function parseConfigBody(state: MutableProfileState, body: unknown): ParsedConfi
       messageReply,
       messageReplyMigrated: true,
       showToolCalls,
+      ackReaction,
       cotMessages,
       maxConcurrentRuns,
       runIdleTimeoutMinutes,

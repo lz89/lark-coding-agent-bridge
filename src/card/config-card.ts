@@ -12,6 +12,8 @@ export interface ConfigFormOpts {
   model: string;
   messageReply: MessageReplyMode;
   showToolCalls: boolean;
+  /** Receipt reaction on each accepted message (`emoji_type`); `undefined` = off. */
+  ackReaction: string | undefined;
   cotMessages: CotMessagesMode;
   maxConcurrentRuns: number;
   /** 0 means "disabled". */
@@ -209,6 +211,19 @@ export function configFormCard(opts: ConfigFormOpts): object {
             {
               tag: 'markdown',
               content:
+                '\n**收到回执**\n' +
+                '_消息一被接收就在它上面加个表情:排队等着的、追问进正在跑的任务的,都有_\n' +
+                '_被 /stop 或其他命令丢掉的消息,表情会撤回_',
+            },
+            {
+              tag: 'select_static',
+              name: 'ack_reaction',
+              initial_option: opts.ackReaction ?? 'off',
+              options: ackReactionOptions(opts.ackReaction),
+            },
+            {
+              tag: 'markdown',
+              content:
                 '\n**COT 过程消息**\n' +
                 '_关闭:只发送最终回复_\n' +
                 '_简略:展示 agent 过程文本和工具摘要_\n' +
@@ -351,6 +366,7 @@ export function configSavedCard(opts: ConfigFormOpts): object {
             `**模型**:\`${modelLabel(opts.agentKind, opts.model)}\`\n` +
             `**消息回复方式**:${replyLabel}\n` +
             `**工具调用显示**:\`${opts.showToolCalls ? 'show' : 'hide'}\`\n` +
+            `**收到回执**:\`${opts.ackReaction ?? '关闭'}\`\n` +
             `**COT 过程消息**:\`${cotLabel}\`\n` +
             `**并发上限**:\`${opts.maxConcurrentRuns}\`\n` +
             `**run 探活**:\`${opts.runIdleTimeoutMinutes > 0 ? `${opts.runIdleTimeoutMinutes} 分钟` : '关闭'}\`\n` +
@@ -367,6 +383,24 @@ export function configSavedCard(opts: ConfigFormOpts): object {
       ],
     },
   };
+}
+
+/**
+ * The receipt picker: the stickers that read as "got it", plus off. A value
+ * set by hand in config.json that is none of these is listed as itself, so the
+ * form shows what is in effect and re-submitting keeps it.
+ */
+function ackReactionOptions(current: string | undefined): object[] {
+  const options = [
+    { text: { tag: 'plain_text', content: 'GET / 收到(默认)' }, value: 'Get' },
+    { text: { tag: 'plain_text', content: 'OK' }, value: 'OK' },
+    { text: { tag: 'plain_text', content: '👍' }, value: 'THUMBSUP' },
+    { text: { tag: 'plain_text', content: '关闭' }, value: 'off' },
+  ];
+  if (current !== undefined && !options.some((o) => o.value === current)) {
+    options.unshift({ text: { tag: 'plain_text', content: current }, value: current });
+  }
+  return options;
 }
 
 function cotMessagesLabel(value: CotMessagesMode): string {

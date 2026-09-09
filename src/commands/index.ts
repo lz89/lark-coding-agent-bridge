@@ -28,6 +28,7 @@ import { forgetManagedCard, sendManagedCard, updateManagedCard } from '../card/m
 import { helpCard, resumeCard, statusCard, workspacesCard } from '../card/templates';
 import type { AppConfig, AppPreferences, MessageReplyMode, TenantBrand } from '../config/schema';
 import {
+  getAckReaction,
   getAgentStopGraceMs,
   getCotMessages,
   getGoalMaxHours,
@@ -1884,6 +1885,7 @@ async function showConfigForm(ctx: CommandContext): Promise<void> {
     ),
     messageReply: getMessageReplyMode(ctx.controls.cfg),
     showToolCalls: getShowToolCalls(ctx.controls.cfg),
+    ackReaction: getAckReaction(ctx.controls.cfg),
     cotMessages: getCotMessages(ctx.controls.cfg),
     maxConcurrentRuns: getMaxConcurrentRuns(ctx.controls.cfg),
     runIdleTimeoutMinutes: ms ? Math.round(ms / 60_000) : 0,
@@ -1936,6 +1938,12 @@ async function submitConfig(ctx: CommandContext): Promise<void> {
       : getMessageReplyMode(ctx.controls.cfg);
   const rawTools = String(fv.show_tool_calls ?? '').trim();
   const showToolCalls = rawTools !== 'hide';
+  // Parse ack_reaction: 'off' turns the receipt off, any other pick is the
+  // emoji type, empty keeps the current setting (stored explicitly from here
+  // on, so a later default change does not move a saved choice).
+  const rawAck = String(fv.ack_reaction ?? '').trim();
+  const ackReaction: string | false =
+    rawAck === 'off' ? false : rawAck !== '' ? rawAck : (getAckReaction(ctx.controls.cfg) ?? false);
   // Parse the model picker. Unexpected / empty values keep the current
   // selection. Store `undefined` for the "default" sentinel to keep config
   // tidy (resolveModelArg treats both the same way).
@@ -2032,6 +2040,7 @@ async function submitConfig(ctx: CommandContext): Promise<void> {
       // explicitly picks any option gets out of the legacy-coerce path.
       messageReplyMigrated: true,
       showToolCalls,
+      ackReaction,
       cotMessages,
       maxConcurrentRuns,
       runIdleTimeoutMinutes,
@@ -2078,6 +2087,7 @@ async function submitConfig(ctx: CommandContext): Promise<void> {
       mode,
       messageReply,
       showToolCalls,
+      ackReaction,
       cotMessages,
       maxConcurrentRuns,
       runIdleTimeoutMinutes,
@@ -2097,6 +2107,7 @@ async function submitConfig(ctx: CommandContext): Promise<void> {
         model: modelSelection,
         messageReply,
         showToolCalls,
+        ackReaction: ackReaction === false ? undefined : ackReaction,
         cotMessages,
         maxConcurrentRuns,
         runIdleTimeoutMinutes,

@@ -487,3 +487,57 @@ describe('ScopeDispatcher', () => {
     expect(DEFAULT_MAX_STEERS_PER_RUN).toBeGreaterThan(0);
   });
 });
+
+describe('onLost: what the dispatcher let go without any run handling it', () => {
+  const lostIds = () => {
+    const lost: string[][] = [];
+    const onLost = (msgs: NormalizedMessage[]) => {
+      lost.push(msgs.map((m) => m.messageId));
+    };
+    return { lost, onLost };
+  };
+
+  it('reports what a discard found waiting, oldest first, including a batch mid-preparation', async () => {
+    const gate = gatedPrepare();
+    const { lost, onLost } = lostIds();
+    const d = dispatcher(gate.prepare, { onLost });
+    d.setActive({ run: fakeRun().run, goalRound: false });
+    d.offer([msg('1', 'preparing')]);
+    d.offer([msg('2', 'waiting behind it'), msg('3', 'same batch')]);
+
+    expect(d.discard()).toEqual({ backlog: 2, inflight: 0 });
+    expect(lost).toEqual([['1', '2', '3']]);
+    gate.release();
+    await tick();
+    // The late job finds its batch gone; nothing is reported twice.
+    expect(lost).toHaveLength(1);
+    expect(d.drain()).toEqual([]);
+  });
+
+  it('reports an in-flight message only once the agent drops it after a discard', async () => {
+    const { lost, onLost } = lostIds();
+    const d = dispatcher(undefined, { onLost });
+    d.setActive({ run: fakeRun().run, goalRound: false });
+    d.offer([msg('1', 'x')]);
+    await tick();
+
+    // In the agent's stdin: a discard cannot take it back, so nothing is lost yet.
+    d.discard();
+    expect(lost).toEqual([]);
+    d.dropped(['u1']);
+    expect(lost).toEqual([['1']]);
+  });
+
+  it('reports nothing for a message the agent took in, or one that is re-delivered', async () => {
+    const { lost, onLost } = lostIds();
+    const d = dispatcher(undefined, { onLost });
+    d.setActive({ run: fakeRun().run, goalRound: false });
+    d.offer([msg('1', 'taken in')]);
+    d.offer([msg('2', 'dropped, retained')]);
+    await tick();
+    d.acknowledge('u1');
+    d.dropped(['u2']);
+    expect(lost).toEqual([]);
+    expect(d.drain().map((m) => m.messageId)).toEqual(['2']);
+  });
+});
