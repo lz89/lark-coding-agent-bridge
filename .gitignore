@@ -25,3 +25,6 @@ tests-smoke/
 
 # pnpm local store (never commit)
 .pnpm-store/
+
+# npm pack output (never commit)
+*.tgz

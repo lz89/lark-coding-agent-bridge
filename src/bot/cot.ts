@@ -254,7 +254,11 @@ export function finalAnswerOnlyState(state: RunState): RunState {
     ...state,
     blocks: state.finalText
       ? [{ kind: 'text', content: state.finalText, streaming: false }]
-      : state.blocks.filter((b) => b.kind === 'text'),
+      : // Tool calls belong to the COT bubble; the answer keeps the agent's
+        // text and, in order, the user's own mid-run messages — the reply is
+        // where the reader sees at which point a correction was taken in.
+        // They are still not the agent answering (`hasDeliverableContent`).
+        state.blocks.filter((b) => b.kind === 'text' || b.kind === 'user'),
     reasoning: { content: '', active: false },
     footer: null,
   };

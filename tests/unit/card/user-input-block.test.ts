@@ -61,11 +61,20 @@ describe('user_input in RunState', () => {
     expect(withoutUserInput(plain)).toBe(plain);
   });
 
-  it('stays out of the final-answer-only projection', () => {
-    const s = reduce(withUser('x'), { type: 'text', delta: 'answer' });
+  it('stays in the final-answer-only projection, in order, while tools drop out', () => {
+    // COT mode posts the answer as its own message: the reader should see at
+    // which point the correction was taken in, not only that it was.
+    const before = reduce(initialState, { type: 'text', delta: 'first' });
+    const tool = reduce(before, { type: 'tool_use', id: 't', name: 'Read', input: {} });
+    const s = reduce(withUser('x', tool), { type: 'text', delta: 'answer' });
     expect(finalAnswerOnlyState(s).blocks).toEqual([
+      { kind: 'text', content: 'first', streaming: false },
+      { kind: 'user', content: 'x', uuid: 'u1' },
       { kind: 'text', content: 'answer', streaming: true },
     ]);
+    // …but it is still not the agent having answered.
+    const only = reduce(withUser('x'), { type: 'done', terminationReason: 'normal' });
+    expect(hasDeliverableContent(finalAnswerOnlyState(only))).toBe(false);
   });
 
   it('turn_end and input_dropped leave the state untouched', () => {
