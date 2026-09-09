@@ -204,6 +204,36 @@ describe('ScopeDispatcher', () => {
     expect(d.stats()).toEqual({ backlog: 1, inflight: 0, preparing: 0 });
   });
 
+  it('discard keeps the books for what is already in the agent, and only stops its re-delivery', async () => {
+    const d = dispatcher();
+    const t = signalTracker();
+    d.setActive({ run: fakeRun().run, goalRound: true, steerSignal: t.steerSignal });
+    d.offer([msg('1', 'in the agent already')]);
+    await tick();
+    expect(d.stats().inflight).toBe(1);
+
+    // `/help`, say — a command that drops the queue, with nothing waiting.
+    expect(d.discard()).toEqual({ backlog: 0, inflight: 1 });
+
+    // The agent then takes the message in: shown, and its path decides the round.
+    expect(d.displayFor('u1')).toBe('shown:in the agent already');
+    expect(d.acknowledge('u1')).toBe(true);
+    expect(t.incorporated).toEqual(['/g/round.steer1']);
+    expect(d.displayFor('u1')).toBe('shown:in the agent already');
+    expect(d.drain()).toEqual([]);
+  });
+
+  it('a discarded message the agent never took in is not re-delivered', async () => {
+    const d = dispatcher();
+    d.setActive({ run: fakeRun().run, goalRound: false });
+    d.offer([msg('1', 'x')]);
+    await tick();
+    d.discard();
+    d.dropped(['u1']);
+    expect(d.stats()).toEqual({ backlog: 0, inflight: 0, preparing: 0 });
+    expect(d.drain()).toEqual([]);
+  });
+
   it('a discard mid-preparation wins: the batch is neither sent nor retained', async () => {
     const gate = gatedPrepare();
     const d = dispatcher(gate.prepare);

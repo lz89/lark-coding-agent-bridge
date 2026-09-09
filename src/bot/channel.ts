@@ -944,7 +944,7 @@ async function intakeMessage(deps: IntakeDeps): Promise<void> {
     log.info('intake', 'command', {
       scope,
       droppedPending: dropped.length,
-      ...(retained ? { droppedRetained: retained.backlog, droppedInflight: retained.inflight } : {}),
+      ...(retained ? { droppedRetained: retained.backlog, inflightNoRetry: retained.inflight } : {}),
       ...(keepPending ? { keptPending: true } : {}),
     });
     // Pushed after the cancel above, or it would be dropped as stale chatter.

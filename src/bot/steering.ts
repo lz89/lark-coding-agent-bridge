@@ -71,6 +71,12 @@ interface InflightSteer {
   batch: NormalizedMessage[];
   display: string;
   onIncorporated?: () => void;
+  /**
+   * An interrupt or a queue-dropping command landed after this was handed
+   * over. It cannot be taken back from the agent, so its receipt still counts
+   * — but if the agent never takes it in, it is not re-delivered either.
+   */
+  discarded?: boolean;
 }
 
 /**
@@ -248,6 +254,12 @@ export class ScopeDispatcher {
       const entry = this.inflight.get(uuid);
       if (!entry) continue;
       this.inflight.delete(uuid);
+      if (entry.discarded) {
+        // Dropped by the queue in the meantime; a message that never reached
+        // the agent and was told to go away is not re-delivered.
+        log.info('steer', 'dropped-discarded', { scope: this.deps.scope, uuid, seq: entry.seq });
+        continue;
+      }
       this.backlog.set(entry.seq, entry.batch);
       log.info('steer', 'dropped', { scope: this.deps.scope, uuid, seq: entry.seq });
     }
@@ -264,16 +276,18 @@ export class ScopeDispatcher {
   }
 
   /**
-   * An interrupt landed: drop what is waiting, as `/stop` has always dropped
-   * the queue. What is in flight is already in the agent and will still be
-   * echoed and shown; it is only removed from retry bookkeeping. Messages that
+   * An interrupt landed, or a command that drops the queue: what is waiting
+   * goes, as `/stop` has always dropped the queue. What is in flight is
+   * already in the agent and cannot be taken back — its receipt still counts
+   * (the reply shows it, a goal round learns its signal path from it); it is
+   * only never re-delivered should the agent not take it in. Messages that
    * arrive after this are new and are kept.
    */
   discard(): { backlog: number; inflight: number } {
     const counts = { backlog: this.backlog.size, inflight: this.inflight.size };
     this.generation += 1;
     this.backlog.clear();
-    this.inflight.clear();
+    for (const entry of this.inflight.values()) entry.discarded = true;
     if (counts.backlog > 0 || counts.inflight > 0) {
       log.info('steer', 'discarded', { scope: this.deps.scope, ...counts });
     }

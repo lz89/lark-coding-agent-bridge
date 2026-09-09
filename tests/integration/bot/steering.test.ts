@@ -312,6 +312,30 @@ describe('steering: a message that arrives mid-run', () => {
     expect(h.agent.runOptions[1]!.prompt).toContain('后来的');
   });
 
+  it('a harmless command between the hand-over and its receipt does not lose the receipt', async () => {
+    const h = await createHarness();
+    await startTestBridge(h);
+    vi.useFakeTimers();
+
+    await startRun(h, message('om_1', 'go'));
+    await emit(h, { type: 'text', delta: '…' });
+    await sendMidRun(h, message('om_2', '改成蓝色'));
+    const steer = h.agent.sends[0]!;
+
+    // `/help` drops the queue, as every handled command does. The steer is
+    // already in the agent's stdin; that must not erase what we know about it.
+    await h.channel.handlers.message?.(message('om_3', '/help'));
+    await settle();
+    await emit(h, { type: 'user_input', uuid: steer.uuid, text: steer.text });
+    expect(h.lastCardJson()).toContain('> 💬 [User (user)]: 改成蓝色');
+    expect(h.lastCardJson()).not.toContain('bridge_steer');
+
+    await finishRun(h);
+    await vi.advanceTimersByTimeAsync(DEBOUNCE_MS * 2);
+    await settle();
+    expect(h.agent.runOptions).toHaveLength(1);
+  });
+
   it('/stop drops what the dispatcher was holding, as it drops the queue', async () => {
     const h = await createHarness();
     await startTestBridge(h);
