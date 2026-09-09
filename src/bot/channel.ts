@@ -97,7 +97,7 @@ import { commandSessionCatalogIdentity } from './session-catalog-identity';
 import { startKeepalive } from './keepalive';
 import { PendingQueue } from './pending-queue';
 import { ProcessPool } from './process-pool';
-import { ScopeDispatcher, type SteerContext } from './steering';
+import { ScopeDispatcher, type PreparedSteer, type SteerContext } from './steering';
 import { fetchQuotedContext, fetchTopicContext, type QuotedContext } from './quote';
 import { lookupMessageThreadId } from './thread-id';
 import { addWorkingReaction, removeReaction } from './reaction';
@@ -994,8 +994,9 @@ interface GoalRunContext {
   signalPath: string;
   /**
    * Each message handed to the round mid-run is told to write a *fresh* signal
-   * path, and the round is judged by the last one delivered. Called with each
-   * such path as it reaches the agent, so the driver knows which one that is.
+   * path, and the round is judged by the last one the agent took in. Called
+   * with each such path as its message's receipt arrives, so the driver knows
+   * which one that is.
    */
   onSteerSignalPath?: (path: string) => void;
 }
@@ -1064,9 +1065,11 @@ async function driveScopeRun(deps: GoalDriveDeps): Promise<void> {
       if (!state || !signalPath) return;
 
       // A mid-run message re-issues the signal path; only the last one the
-      // agent was told about decides the round. Earlier files — a `continue`
-      // written before the agent read the message, or a late write from
-      // something it detached — are removed unread.
+      // agent actually took in decides the round. Earlier files — a
+      // `continue` written before the agent read the message, or a late write
+      // from something it detached — are removed unread. A message the agent
+      // never took in issued nothing, so the round's original path still
+      // stands, along with whatever the agent wrote to it.
       const effectiveSignalPath = steerSignalPaths.at(-1) ?? signalPath;
       for (const stale of [signalPath, ...steerSignalPaths]) {
         if (stale !== effectiveSignalPath) await rm(stale, { force: true }).catch(() => {});
@@ -1517,12 +1520,15 @@ async function runAgentBatch(deps: RunBatchDeps): Promise<RoundOutcome> {
       ? {
           steerSignal: {
             issue: () => `${goalMode.signalPath}.steer${++steerSignals}`,
-            delivered: (path) => goalMode.onSteerSignalPath?.(path),
+            incorporated: (path) => goalMode.onSteerSignalPath?.(path),
           },
         }
       : {}),
   });
   const ledger = consumeSteerReceipts(execution.subscribe(), { dispatcher, scope });
+  // The receipt's own text is the envelope the agent was handed; the reply
+  // shows the user's words instead.
+  const steerDisplay = (uuid: string): string | undefined => dispatcher.displayFor(uuid);
   if (flow.resumeFrom) {
     log.info('session', 'resume', { sessionId: flow.resumeFrom, cwd });
   } else {
@@ -1676,6 +1682,7 @@ async function runAgentBatch(deps: RunBatchDeps): Promise<RoundOutcome> {
           async () => {},
           toolStallTimeoutMs,
           toolStallGraceMs,
+          steerDisplay,
         )).then(trackTerminal);
         await cotDone;
         if (cotPublisher.degradedReason) {
@@ -1746,6 +1753,7 @@ async function runAgentBatch(deps: RunBatchDeps): Promise<RoundOutcome> {
         },
         toolStallTimeoutMs,
         toolStallGraceMs,
+        steerDisplay,
       )).then(trackTerminal);
       try {
         await awaitRenderAwareStream({
@@ -1828,6 +1836,7 @@ async function runAgentBatch(deps: RunBatchDeps): Promise<RoundOutcome> {
         },
         toolStallTimeoutMs,
         toolStallGraceMs,
+        steerDisplay,
       )).then(trackTerminal);
       try {
         await awaitRenderAwareStream({
@@ -1887,6 +1896,7 @@ async function runAgentBatch(deps: RunBatchDeps): Promise<RoundOutcome> {
         async () => {},
         toolStallTimeoutMs,
         toolStallGraceMs,
+        steerDisplay,
       )).then(trackTerminal);
       await sendFinalReply({
         channel,
@@ -2225,6 +2235,8 @@ async function processAgentStream(
   flush: (state: RunState) => Promise<void>,
   toolStallTimeoutMs?: number | undefined,
   toolStallGraceMs = 0,
+  /** Text to show for a `user_input` receipt, in place of the replayed envelope. */
+  steerDisplay?: (uuid: string) => string | undefined,
 ): Promise<RunState> {
   const runStart = Date.now();
   let state: RunState = initialState;
@@ -2347,7 +2359,9 @@ async function processAgentStream(
         // on screen stays: the warning lives outside `state` (the watchdog
         // only flushes it), so it is put back for this render.
         const base = stallNotice && !stallFired ? markStalled(state, stallNotice) : state;
-        state = reduce(base, evt);
+        // The replayed text is the envelope the agent got; show the user's words.
+        const text = steerDisplay?.(evt.uuid) ?? evt.text;
+        state = reduce(base, { ...evt, text });
         log.info('card', 'user-input', { scope, uuid: evt.uuid });
         await flush(state);
         continue;
@@ -2722,9 +2736,9 @@ async function buildSteerText(
   channel: LarkChannel,
   batch: NormalizedMessage[],
   ctx: SteerContext,
-): Promise<string> {
+): Promise<PreparedSteer> {
   const first = batch[0];
-  if (!first) return '';
+  if (!first) return { text: '', display: '' };
   const batchIds = new Set(batch.map((m) => m.messageId));
   const quoteTargets = [
     ...new Set(
@@ -2761,14 +2775,17 @@ async function buildSteerText(
         : '闭环模式提示：处理完这条消息后，如果目标仍未闭环，请在本轮结束前重新写入信号文件（即使之前已经写过）。',
     );
   }
-  return [
-    promptSection('bridge_steer', context),
-    quotes.length > 0 ? promptSection('quoted_messages', quotes) : undefined,
-    promptSection('bridge_instructions', notes),
-    promptSection('user_input', { text }),
-  ]
-    .filter(Boolean)
-    .join('\n\n');
+  return {
+    text: [
+      promptSection('bridge_steer', context),
+      quotes.length > 0 ? promptSection('quoted_messages', quotes) : undefined,
+      promptSection('bridge_instructions', notes),
+      promptSection('user_input', { text }),
+    ]
+      .filter(Boolean)
+      .join('\n\n'),
+    display: text,
+  };
 }
 
 /**

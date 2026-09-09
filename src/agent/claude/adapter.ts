@@ -314,7 +314,14 @@ async function* createEventStream(
         if (evt.type === 'user_input') {
           // The prompt itself is replayed too; only a handed-over message is a
           // receipt anyone is waiting for.
-          if (input.acknowledge(evt.uuid) === 'steer') yield evt;
+          if (input.acknowledge(evt.uuid) === 'steer') {
+            // The follow-on turn this message was waiting for has started. The
+            // result held back for it no longer stands in for anything: that
+            // turn ends the run with its own result, or — if it dies first —
+            // with no terminal at all, which is the truth about it.
+            heldTerminal = undefined;
+            yield evt;
+          }
           continue;
         }
         yield evt;

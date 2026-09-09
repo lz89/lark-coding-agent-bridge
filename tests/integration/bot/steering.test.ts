@@ -121,10 +121,13 @@ describe('steering: a message that arrives mid-run', () => {
     // Still one run — nothing was queued for later.
     expect(h.agent.runOptions).toHaveLength(1);
 
-    // Before the receipt the card shows nothing of it; after, it is quoted.
+    // Before the receipt the card shows nothing of it; after, it is quoted —
+    // the user's words, not the envelope the CLI replays.
     expect(h.lastCardJson()).not.toContain('改成蓝色');
-    await emit(h, { type: 'user_input', uuid: steer.uuid, text: '[User (user)]: 等等，改成蓝色' });
+    await emit(h, { type: 'user_input', uuid: steer.uuid, text: steer.text });
     expect(h.lastCardJson()).toContain('> 💬 [User (user)]: 等等，改成蓝色');
+    expect(h.lastCardJson()).not.toContain('bridge_steer');
+    expect(h.lastCardJson()).not.toContain('bridge_instructions');
     await emit(h, { type: 'text', delta: '好，蓝色。' });
 
     await finishRun(h);
@@ -208,7 +211,7 @@ describe('steering: a message that arrives mid-run', () => {
 
     await sendMidRun(h, message('om_2', '还在吗'));
     const steer = h.agent.sends[0]!;
-    await emit(h, { type: 'user_input', uuid: steer.uuid, text: '[User (user)]: 还在吗' });
+    await emit(h, { type: 'user_input', uuid: steer.uuid, text: steer.text });
     // The receipt is rendered, and the warning is still there next to it.
     expect(h.lastCardJson()).toContain('还在吗');
     expect(h.lastCardJson()).toContain('无输出');

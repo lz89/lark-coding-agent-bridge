@@ -358,6 +358,29 @@ describe('ClaudeAdapter steering', () => {
     expect((events.at(-1) as { sessionId?: string }).sessionId).toBe('sess-1');
   });
 
+  it('a follow-on turn that dies after taking the message in is a failure, not the held result', async () => {
+    const fake = await createFakeClaude({
+      turns: [
+        [text('turn one'), { type: 'result', session_id: 'sess-1' }],
+        // Takes the message in (replay), starts working, then crashes.
+        [text('turn two'), { __exit: 1 }],
+      ],
+      stderr: 'segfault\n',
+    });
+    cleanup.push(fake.dir);
+    const run = new ClaudeAdapter({ binary: fake.path }).run({
+      runId: 'run-spill-crash',
+      prompt: 'start',
+      cwd: fake.dir,
+    });
+
+    const events = await driveWithSteer(run, 'and this', (e) => e.type === 'text');
+
+    expect(events.map((e) => e.type)).toEqual(['text', 'turn_end', 'user_input', 'text', 'error']);
+    expect(events.some((e) => e.type === 'done')).toBe(false);
+    expect((events.at(-1) as { message: string }).message).toContain('exited with code 1');
+  });
+
   it('a message the CLI never took in is reported dropped, and the held result still ends the run normally', async () => {
     const fake = await createFakeClaude({
       turns: [
@@ -553,10 +576,11 @@ async function createFakeClaude(options: {
       '    }',
       '    if (line && line.__closeStdin) { process.stdin.destroy(); continue; }',
       '    if (line && line.__awaitEvent === "never") { await new Promise(() => {}); }',
+      '    if (line && typeof line.__exit === "number") { finish(line.__exit); return; }',
       '    emit(line);',
       '  }',
       '}',
-      'function finish() {',
+      'function finish(code) {',
       '  if (finished) return;',
       '  finished = true;',
       `  writeFileSync(${JSON.stringify(recordPath)}, JSON.stringify({`,
@@ -574,7 +598,7 @@ async function createFakeClaude(options: {
       '    },',
       '  }));',
       options.stderr ? `  process.stderr.write(${JSON.stringify(options.stderr)});` : '',
-      `  setTimeout(() => process.exit(${options.exitCode ?? 0}), ${options.exitDelayMs ?? 0});`,
+      `  setTimeout(() => process.exit(code ?? ${options.exitCode ?? 0}), ${options.exitDelayMs ?? 0});`,
       '}',
       'const rl = readline.createInterface({ input: process.stdin });',
       'rl.on("line", (raw) => {',

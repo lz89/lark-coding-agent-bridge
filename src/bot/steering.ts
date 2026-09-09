@@ -13,15 +13,16 @@ export interface ActiveRunInfo {
   goalRound: boolean;
   /**
    * In a `/goal` round, each message handed over is issued a fresh signal
-   * path, and only the last one delivered counts at the end of the round: a
-   * `continue` the agent wrote before it read the message — or a late write
-   * from something it detached — cannot outlive its later decision.
+   * path, and only the last one the agent actually took in counts at the end
+   * of the round: a `continue` the agent wrote before it read the message —
+   * or a late write from something it detached — cannot outlive its later
+   * decision, and a message it never saw cannot decide anything.
    */
   steerSignal?: {
     /** A new path for the message about to be handed over. */
     issue(): string;
-    /** The message carrying `path` reached the agent's stdin. */
-    delivered(path: string): void;
+    /** The agent took in the message that names `path` (its receipt arrived). */
+    incorporated(path: string): void;
   };
 }
 
@@ -31,15 +32,22 @@ export interface SteerContext {
   signalPath?: string;
 }
 
+export interface PreparedSteer {
+  /** What the agent is handed: the envelope, quotes, instructions, the text. */
+  text: string;
+  /** What the reply shows for it: the user's words, sender-annotated. */
+  display: string;
+}
+
 export interface ScopeDispatcherDeps {
   scope: string;
   /** Messages a command generated (the first task of `/goal`): never steered. */
   isNonSteerable: (msg: NormalizedMessage) => boolean;
   /**
-   * Build the text handed to the running agent. May fetch (quotes), may throw;
+   * Build what is handed to the running agent. May fetch (quotes), may throw;
    * a throw leaves the batch retained for the next run.
    */
-  prepare: (batch: NormalizedMessage[], ctx: SteerContext) => Promise<string>;
+  prepare: (batch: NormalizedMessage[], ctx: SteerContext) => Promise<PreparedSteer>;
   maxSteersPerRun?: number;
   maxSteerChars?: number;
 }
@@ -57,6 +65,13 @@ export const DEFAULT_SETTLE_TIMEOUT_MS = 15_000;
 
 /** Message shapes whose whole meaning survives being passed as text. */
 const STEERABLE_CONTENT_TYPES = new Set(['text', 'post']);
+
+interface InflightSteer {
+  seq: number;
+  batch: NormalizedMessage[];
+  display: string;
+  onIncorporated?: () => void;
+}
 
 /**
  * Whether a batch can be handed to a running turn as text without losing
@@ -101,7 +116,13 @@ export class ScopeDispatcher {
   private retired = false;
   private active: (ActiveRunInfo & { steers: number }) | undefined;
   private readonly backlog = new Map<number, NormalizedMessage[]>();
-  private readonly inflight = new Map<string, { seq: number; batch: NormalizedMessage[] }>();
+  private readonly inflight = new Map<string, InflightSteer>();
+  /**
+   * Display text of messages the agent took in, by uuid. The receipt ledger
+   * and the render loop read the same event on separate subscriptions in no
+   * fixed order, so the text has to outlive the in-flight entry.
+   */
+  private readonly shown = new Map<string, string>();
   private readonly preparing = new Set<Promise<void>>();
   /** Seqs whose steer job has not finished — in the backlog, but not (yet) retained. */
   private readonly preparingSeqs = new Set<number>();
@@ -206,8 +227,19 @@ export class ScopeDispatcher {
     const entry = this.inflight.get(uuid);
     if (!entry) return false;
     this.inflight.delete(uuid);
+    this.shown.set(uuid, entry.display);
+    entry.onIncorporated?.();
     log.info('steer', 'incorporated', { scope: this.deps.scope, uuid, seq: entry.seq });
     return true;
+  }
+
+  /**
+   * What to show on the reply for a message the agent took in — the user's
+   * words, not the envelope they travelled in. Known from the moment the
+   * message was handed over, whichever subscription asks first.
+   */
+  displayFor(uuid: string): string | undefined {
+    return this.shown.get(uuid) ?? this.inflight.get(uuid)?.display;
   }
 
   /** The run ended without taking these in: back to the backlog, at their seq. */
@@ -303,12 +335,12 @@ export class ScopeDispatcher {
     active: ActiveRunInfo & { steers: number },
   ): Promise<void> {
     // Issued before preparation because the text carries it; only reported
-    // as delivered once the send succeeded, so a path the agent never saw
-    // cannot become the one the round is judged by.
+    // once the agent's receipt for the message arrives, so a path the agent
+    // never saw cannot become the one the round is judged by.
     const signalPath = active.steerSignal?.issue();
-    let text: string;
+    let prepared: PreparedSteer;
     try {
-      text = await this.deps.prepare(batch, {
+      prepared = await this.deps.prepare(batch, {
         goalRound: active.goalRound,
         ...(signalPath ? { signalPath } : {}),
       });
@@ -316,6 +348,7 @@ export class ScopeDispatcher {
       log.warn('steer', 'prepare-failed', { scope: this.deps.scope, seq, err: String(err) });
       return;
     }
+    const { text, display } = prepared;
     // Everything below re-checks what the await may have changed. Any miss
     // leaves the batch where it is — retained — which is always safe.
     if (this.retired || generation !== this.generation || !this.backlog.has(seq)) return;
@@ -341,8 +374,17 @@ export class ScopeDispatcher {
     }
     active.steers += 1;
     this.backlog.delete(seq);
-    this.inflight.set(res.uuid, { seq, batch });
-    if (signalPath) active.steerSignal?.delivered(signalPath);
+    const steerSignal = active.steerSignal;
+    this.inflight.set(res.uuid, {
+      seq,
+      batch,
+      display,
+      // Bound now: by the time the receipt arrives the run may already have
+      // been cleared as active, and the round still has to learn its path.
+      ...(signalPath && steerSignal
+        ? { onIncorporated: () => steerSignal.incorporated(signalPath) }
+        : {}),
+    });
     log.info('steer', 'sent', {
       scope: this.deps.scope,
       seq,

@@ -55,6 +55,7 @@ const tick = async (): Promise<void> => {
   for (let i = 0; i < 200; i++) await Promise.resolve();
 };
 
+/** Test preparations return the text alone; what the reply shows is the same text. */
 function dispatcher(
   prepare: (batch: NormalizedMessage[], ctx: SteerContext) => Promise<string> = async (b) =>
     b.map((m) => m.content).join('\n'),
@@ -63,7 +64,10 @@ function dispatcher(
   return new ScopeDispatcher({
     scope: 'oc_1',
     isNonSteerable: () => false,
-    prepare,
+    prepare: async (b, ctx) => {
+      const text = await prepare(b, ctx);
+      return { text, display: `shown:${text}` };
+    },
     ...extra,
   });
 }
@@ -314,7 +318,10 @@ describe('ScopeDispatcher', () => {
     const d = new ScopeDispatcher({
       scope: 'oc_1',
       isNonSteerable: (m) => m === task,
-      prepare: async (b) => b.map((m) => m.content).join('\n'),
+      prepare: async (b) => {
+        const text = b.map((m) => m.content).join('\n');
+        return { text, display: text };
+      },
     });
     const { run, sent } = fakeRun();
     d.setActive({ run, goalRound: false });
@@ -338,18 +345,18 @@ describe('ScopeDispatcher', () => {
 
   function signalTracker() {
     const issued: string[] = [];
-    const delivered: string[] = [];
+    const incorporated: string[] = [];
     let n = 0;
     return {
       issued,
-      delivered,
+      incorporated,
       steerSignal: {
         issue: () => {
           const p = `/g/round.steer${++n}`;
           issued.push(p);
           return p;
         },
-        delivered: (p: string) => delivered.push(p),
+        incorporated: (p: string) => incorporated.push(p),
       },
     };
   }
@@ -367,17 +374,51 @@ describe('ScopeDispatcher', () => {
     d.offer([msg('2', 'b')]);
     await tick();
     expect(seen).toEqual(['/g/round.steer1', '/g/round.steer2']);
-    expect(t.delivered).toEqual(['/g/round.steer1', '/g/round.steer2']);
+    expect(t.issued).toEqual(['/g/round.steer1', '/g/round.steer2']);
+    // Sent is not taken in: the round learns a path only from the receipt.
+    expect(t.incorporated).toEqual([]);
+    d.acknowledge('u1');
+    expect(t.incorporated).toEqual(['/g/round.steer1']);
+    d.acknowledge('u2');
+    expect(t.incorporated).toEqual(['/g/round.steer1', '/g/round.steer2']);
   });
 
-  it('a path issued to a message that never reached the agent is not reported delivered', async () => {
+  it('a path issued to a message the agent never took in is never reported', async () => {
     const d = dispatcher();
     const t = signalTracker();
-    d.setActive({ run: fakeRun({ accept: false }).run, goalRound: true, steerSignal: t.steerSignal });
-    d.offer([msg('1', 'refused')]);
+    const { run } = fakeRun();
+    d.setActive({ run, goalRound: true, steerSignal: t.steerSignal });
+    d.offer([msg('1', 'sent but dropped')]);
     await tick();
     expect(t.issued).toEqual(['/g/round.steer1']);
-    expect(t.delivered).toEqual([]);
+    d.dropped(['u1']);
+    expect(t.incorporated).toEqual([]);
+    // Still true after the run's books are settled.
+    d.clearActive();
+    d.reconcileRunEnd();
+    expect(t.incorporated).toEqual([]);
+  });
+
+  it('reports the path even if the receipt arrives after the run was cleared as active', async () => {
+    const d = dispatcher();
+    const t = signalTracker();
+    d.setActive({ run: fakeRun().run, goalRound: true, steerSignal: t.steerSignal });
+    d.offer([msg('1', 'x')]);
+    await tick();
+    d.clearActive();
+    d.acknowledge('u1');
+    expect(t.incorporated).toEqual(['/g/round.steer1']);
+  });
+
+  it('knows what to show for a message from the moment it is handed over', async () => {
+    const d = dispatcher();
+    d.setActive({ run: fakeRun().run, goalRound: false });
+    d.offer([msg('1', 'change it')]);
+    await tick();
+    expect(d.displayFor('u1')).toBe('shown:change it');
+    d.acknowledge('u1');
+    expect(d.displayFor('u1')).toBe('shown:change it');
+    expect(d.displayFor('nope')).toBeUndefined();
   });
 
   it('settle gives up on a preparation that never finishes, without losing the batch', async () => {
