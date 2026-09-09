@@ -6,14 +6,9 @@ function msg(id: string): NormalizedMessage {
   return { messageId: id, chatId: 'oc_1', content: 'x' } as unknown as NormalizedMessage;
 }
 
-interface Call {
-  messageId: string;
-  emojiType: string;
-}
-
 function fakeChannel(opts: { failAdd?: boolean } = {}) {
-  const added: Call[] = [];
-  const removed: Call[] = [];
+  const added: Array<{ messageId: string; emojiType: string }> = [];
+  const removed: Array<{ messageId: string; reactionId: string }> = [];
   let gate: Promise<void> | undefined;
   let open: (() => void) | undefined;
   return {
@@ -34,9 +29,8 @@ function fakeChannel(opts: { failAdd?: boolean } = {}) {
       if (opts.failAdd) throw new Error('invalid emoji');
       return `r${added.length}`;
     },
-    async removeReactionByEmoji(messageId: string, emojiType: string): Promise<boolean> {
-      removed.push({ messageId, emojiType });
-      return true;
+    async removeReaction(messageId: string, reactionId: string): Promise<void> {
+      removed.push({ messageId, reactionId });
     },
   };
 }
@@ -46,7 +40,7 @@ const flush = async (): Promise<void> => {
 };
 
 describe('ReceiptAcks', () => {
-  it('marks a message with the configured emoji, once, and withdraws the same emoji', async () => {
+  it('marks a message with the configured emoji, once, and withdraws that very reaction', async () => {
     const ch = fakeChannel();
     let emoji: string | undefined = 'Get';
     const acks = new ReceiptAcks(ch, () => emoji);
@@ -55,12 +49,13 @@ describe('ReceiptAcks', () => {
     acks.acknowledge(m);
     expect(ch.added).toEqual([{ messageId: 'om_1', emojiType: 'Get' }]);
 
-    // `/config` switched the emoji in the meantime: the mark that was put on
-    // is the one taken off.
+    // `/config` switched the emoji in the meantime; irrelevant — what comes
+    // off is the reaction that went on, by id (never "whichever GET is on the
+    // message": another bot's is not ours).
     emoji = 'OK';
     acks.withdraw([m]);
     await flush();
-    expect(ch.removed).toEqual([{ messageId: 'om_1', emojiType: 'Get' }]);
+    expect(ch.removed).toEqual([{ messageId: 'om_1', reactionId: 'r1' }]);
   });
 
   it('does nothing when the receipt is off', async () => {
@@ -96,9 +91,22 @@ describe('ReceiptAcks', () => {
     expect(ch.removed).toHaveLength(1);
   });
 
+  it('a kept mark is a fact: a later withdrawal of the same message is a no-op', async () => {
+    // The batch reached the agent, then the run threw or was dropped: the
+    // message was handled, and the mark stays.
+    const ch = fakeChannel();
+    const acks = new ReceiptAcks(ch, () => 'Get');
+    const m = msg('om_1');
+    acks.acknowledge(m);
+    acks.keep([m]);
+    acks.withdraw([m]);
+    await flush();
+    expect(ch.removed).toEqual([]);
+  });
+
   it('waits for the add to land before taking the mark back', async () => {
     // A `/stop` 100ms behind a message: the reaction API call for the mark is
-    // still in flight, and a removal issued now would find nothing to remove.
+    // still in flight, and the id to remove is not known yet.
     const ch = fakeChannel();
     ch.hold();
     const acks = new ReceiptAcks(ch, () => 'Get');
@@ -109,10 +117,10 @@ describe('ReceiptAcks', () => {
     expect(ch.removed).toEqual([]);
     ch.release();
     await flush();
-    expect(ch.removed).toEqual([{ messageId: 'om_1', emojiType: 'Get' }]);
+    expect(ch.removed).toEqual([{ messageId: 'om_1', reactionId: 'r1' }]);
   });
 
-  it('swallows a failed add, and still tries the withdrawal after it', async () => {
+  it('swallows a failed add; a withdrawal after it has nothing to remove', async () => {
     const ch = fakeChannel({ failAdd: true });
     const acks = new ReceiptAcks(ch, () => 'Nope');
     const m = msg('om_1');
@@ -120,6 +128,6 @@ describe('ReceiptAcks', () => {
     await flush();
     acks.withdraw([m]);
     await flush();
-    expect(ch.removed).toEqual([{ messageId: 'om_1', emojiType: 'Nope' }]);
+    expect(ch.removed).toEqual([]);
   });
 });

@@ -61,14 +61,22 @@ export async function removeReaction(
  * `/stop`, a queue-dropping command, a run that could not start), so a mark
  * that stays means the message reached the agent, or still will. Only
  * messages marked here are ever touched: a wake or a goal continuation carries
- * the id of a message that earned its own mark, and keeps it.
+ * the id of a message that earned its own mark, and keeps it. And what is
+ * taken back is the reaction that was put on, by its id — another bot's copy
+ * of the same sticker on the same message is not ours to remove.
  */
 export class ReceiptAcks {
-  /** By message object: the emoji used, and the add call a withdrawal waits on. */
-  private readonly marked = new WeakMap<NormalizedMessage, { emoji: string; added: Promise<void> }>();
+  /**
+   * By message object: the emoji used, and the add call — resolving to the
+   * reaction id, or to nothing when the add failed — a withdrawal waits on.
+   */
+  private readonly marked = new WeakMap<
+    NormalizedMessage,
+    { emoji: string; added: Promise<string | undefined> }
+  >();
 
   constructor(
-    private readonly channel: Pick<LarkChannel, 'addReaction' | 'removeReactionByEmoji'>,
+    private readonly channel: Pick<LarkChannel, 'addReaction' | 'removeReaction'>,
     /** Read per message — `/config` changes it while the bridge runs. */
     private readonly emoji: () => string | undefined,
   ) {}
@@ -80,6 +88,7 @@ export class ReceiptAcks {
     const added = this.channel.addReaction(msg.messageId, emoji).then(
       (reactionId) => {
         log.info('reaction', 'ack-added', { messageId: msg.messageId, emoji, reactionId });
+        return reactionId || undefined;
       },
       (err: unknown) => {
         log.warn('reaction', 'ack-failed', {
@@ -87,9 +96,18 @@ export class ReceiptAcks {
           emoji,
           err: err instanceof Error ? err.message : String(err),
         });
+        return undefined;
       },
     );
     this.marked.set(msg, { emoji, added });
+  }
+
+  /**
+   * These reached the agent: their marks are now facts, and stay whatever
+   * happens to the run — a later drop of the same batch is not a loss.
+   */
+  keep(msgs: readonly NormalizedMessage[]): void {
+    for (const msg of msgs) this.marked.delete(msg);
   }
 
   /**
@@ -103,23 +121,20 @@ export class ReceiptAcks {
       if (!mark) continue;
       this.marked.delete(msg);
       void mark.added
-        .then(() => this.channel.removeReactionByEmoji(msg.messageId, mark.emoji))
-        .then(
-          (removed) => {
-            log.info('reaction', 'ack-withdrawn', {
-              messageId: msg.messageId,
-              emoji: mark.emoji,
-              removed,
-            });
-          },
-          (err: unknown) => {
-            log.warn('reaction', 'ack-withdraw-failed', {
-              messageId: msg.messageId,
-              emoji: mark.emoji,
-              err: err instanceof Error ? err.message : String(err),
-            });
-          },
-        );
+        .then(async (reactionId) => {
+          if (!reactionId) {
+            log.info('reaction', 'ack-withdraw-nothing', { messageId: msg.messageId });
+            return;
+          }
+          await this.channel.removeReaction(msg.messageId, reactionId);
+          log.info('reaction', 'ack-withdrawn', { messageId: msg.messageId, reactionId });
+        })
+        .catch((err: unknown) => {
+          log.warn('reaction', 'ack-withdraw-failed', {
+            messageId: msg.messageId,
+            err: err instanceof Error ? err.message : String(err),
+          });
+        });
     }
   }
 }

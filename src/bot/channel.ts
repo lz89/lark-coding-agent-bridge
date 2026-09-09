@@ -1079,7 +1079,17 @@ async function driveScopeRun(deps: GoalDriveDeps): Promise<void> {
         };
       }
 
-      const outcome = await runAgentBatch({ ...deps, batch, ...(goalMode ? { goalMode } : {}) });
+      let outcome: RoundOutcome;
+      try {
+        outcome = await runAgentBatch({ ...deps, batch, ...(goalMode ? { goalMode } : {}) });
+      } catch (err) {
+        // Nothing retries a batch its round threw on. Unless the agent had
+        // been started on it — then it was handled and its marks are kept —
+        // the receipts on it come off: a wake that failed to arm, an
+        // attachment that would not download, a spawn that failed.
+        deps.acks.withdraw(batch);
+        throw err;
+      }
       if (!state || !signalPath) return;
 
       // A mid-run message re-issues the signal path; only the last one the
@@ -1507,6 +1517,10 @@ async function runAgentBatch(deps: RunBatchDeps): Promise<RoundOutcome> {
     },
   });
   if (!flow.ok) {
+    // The agent never started — an unusable cwd, a full pool, a denied policy.
+    // The batch is not retried, so the receipts on it come off; first, so a
+    // notice that hangs cannot leave them on.
+    deps.acks.withdraw(deps.batch);
     log.info('run-flow', 'rejected', { scope, code: flow.rejectReason.code });
     log.warn('policy', 'denied', {
       scope,
@@ -1514,9 +1528,6 @@ async function runAgentBatch(deps: RunBatchDeps): Promise<RoundOutcome> {
       code: flow.rejectReason.code,
     });
     await channel.send(chatId, { markdown: flow.rejectReason.userVisible }, sendOpts);
-    // The agent never started — an unusable cwd, a full pool, a denied policy.
-    // The batch is not retried, so the receipts on it come off.
-    deps.acks.withdraw(deps.batch);
     // The reason went to the user already, but for a goal this is emphatically
     // not "round finished": calling it completed would close the goal as
     // achieved on a round that never ran.
@@ -1524,6 +1535,9 @@ async function runAgentBatch(deps: RunBatchDeps): Promise<RoundOutcome> {
   }
 
   const { execution, cwdRealpath: cwd } = flow;
+  // The batch reached the agent: its receipts are facts now, whatever the run
+  // goes on to do — a throw or a drop past this point is not a lost message.
+  deps.acks.keep(deps.batch);
   activePolicyFingerprints.set(scope, flow.policy.policyFingerprint);
   const handle = execution.handle;
   const eventStream = execution.subscribe();

@@ -625,11 +625,10 @@ interface FakeLarkChannel {
   recallMessage(messageId: string): Promise<void>;
   /** Reactions put on messages, in order (the receipt marks). */
   reactions: Array<{ messageId: string; emojiType: string }>;
-  /** Reactions taken back by emoji, in order. */
+  /** Reactions taken back (by id; listed with the emoji that id carried), in order. */
   withdrawn: Array<{ messageId: string; emojiType: string }>;
   addReaction(messageId: string, emojiType: string): Promise<string>;
   removeReaction(messageId: string, reactionId: string): Promise<void>;
-  removeReactionByEmoji(messageId: string, emojiType: string): Promise<boolean>;
 }
 
 function createFakeLarkChannel(): FakeLarkChannel {
@@ -703,10 +702,10 @@ function createFakeLarkChannel(): FakeLarkChannel {
       reactions.push({ messageId, emojiType });
       return `r${reactions.length}`;
     },
-    async removeReaction() {},
-    async removeReactionByEmoji(messageId, emojiType) {
-      withdrawn.push({ messageId, emojiType });
-      return true;
+    async removeReaction(messageId, reactionId) {
+      const put = reactions[Number(reactionId.slice(1)) - 1];
+      expect(put?.messageId).toBe(messageId);
+      withdrawn.push({ messageId, emojiType: put?.emojiType ?? reactionId });
     },
   };
   return self;
@@ -821,6 +820,26 @@ describe('the receipt: a reaction the moment a message is accepted', () => {
     await settle();
     expect(withdrawn(h)).toEqual(['om_2:Get']);
     expect(h.agent.runOptions).toHaveLength(1);
+  });
+
+  it('comes off a message whose run could not start', async () => {
+    const h = await createHarness();
+    // An unusable working directory: admission rejects, the user is told, and
+    // nothing retries the batch.
+    h.profileConfig.workspaces.default = '/nonexistent/lcb-receipt-test';
+    await startTestBridge(h);
+    vi.useFakeTimers();
+
+    await h.channel.handlers.message?.(message('om_1', 'go'));
+    expect(marks(h)).toEqual(['om_1:Get']);
+    await vi.advanceTimersByTimeAsync(DEBOUNCE_MS + 50);
+    for (let i = 0; i < 200 && h.channel.withdrawn.length === 0; i++) {
+      await vi.advanceTimersByTimeAsync(20);
+      await settle();
+    }
+    expect(withdrawn(h)).toEqual(['om_1:Get']);
+    expect(h.agent.runOptions).toHaveLength(0);
+    expect(JSON.stringify(h.channel.sent)).toContain('lcb-receipt-test');
   });
 
   it('can be turned off, or set to another sticker', async () => {
