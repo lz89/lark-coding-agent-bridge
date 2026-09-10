@@ -171,6 +171,14 @@ export interface CommandContext {
   keepPending?: () => void;
   /** Pause queued turns until maintenance finishes; independent of run blocking. */
   holdPending?: () => () => void;
+  /**
+   * Whether a batch of this scope is already being driven — flushed from the
+   * queue and on its way to a run (attachments downloading, policy being
+   * evaluated), or running. `activeRuns` only knows about it once the run is
+   * reserved, and that gap is exactly when a maintenance run would win the
+   * scope and get the user's batch rejected.
+   */
+  scopeBusy?: () => boolean;
 }
 
 type Handler = (args: string, ctx: CommandContext) => Promise<void>;
@@ -378,7 +386,7 @@ async function handleCompact(args: string, ctx: CommandContext): Promise<void> {
     await reply(ctx, '当前 agent 暂不支持 `/compact`；此命令目前仅支持 Codex。');
     return;
   }
-  if (ctx.activeRuns.get(ctx.scope)) {
+  if (ctx.activeRuns.get(ctx.scope) || ctx.scopeBusy?.()) {
     await reply(ctx, '当前会话有任务运行中，请等任务结束后重试 `/compact`，或先用 `/stop` 停止。');
     return;
   }

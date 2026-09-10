@@ -83,7 +83,12 @@ export class PendingQueue {
     };
   }
 
-  private isBlocked(scope: string): boolean {
+  /**
+   * Whether flushes for `scope` are paused: a driver owns a batch of it (from
+   * the moment the flush handed the batch over, through attachment download
+   * and the run itself, until the run's cleanup) or maintenance holds it.
+   */
+  isBlocked(scope: string): boolean {
     return this.blocked.has(scope) || this.holds.has(scope);
   }
 

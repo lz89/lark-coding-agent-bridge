@@ -868,6 +868,7 @@ async function intakeMessage(deps: IntakeDeps): Promise<void> {
       keepPending = true;
     },
     holdPending: () => pending.hold(scope),
+    scopeBusy: () => pending.isBlocked(scope),
     sessions,
     workspaces,
     agent,

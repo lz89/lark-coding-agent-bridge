@@ -131,6 +131,24 @@ describe('/compact command', () => {
     expect(h.keepPending).toHaveBeenCalledTimes(3);
   });
 
+  it('rejects while a batch of the scope is being driven but not yet reserved', async () => {
+    // Between the queue flushing a batch and the run being reserved — an
+    // attachment downloading, say — activeRuns knows nothing; the queue's
+    // block does. A compaction admitted then would win the scope and get the
+    // user's batch rejected.
+    const h = await harness();
+    h.pending.block(h.ctx.scope);
+    await h.run('/compact');
+    expect(h.markdown()).toContain('任务运行中');
+    expect(h.compact).not.toHaveBeenCalled();
+    h.pending.unblock(h.ctx.scope);
+    const task = h.run('/compact');
+    await vi.waitFor(() => expect(h.compact).toHaveBeenCalledTimes(1));
+    h.finish({ type: 'done', threadId: 'thread-1', terminationReason: 'normal' });
+    await task;
+    expect(h.markdown()).toContain('上下文已压缩');
+  });
+
   it('rejects a reserved scope or full pool and keeps the queue intact', async () => {
     const h = await harness();
     const release = h.activeRuns.reserve(h.ctx.scope)!;
@@ -238,6 +256,7 @@ async function harness(topic = false, metadata: AgentEvent[] = []) {
     sessions, sessionCatalog: catalog, workspaces, agent, activeRuns, controls,
     runExecutor: new RunExecutor({ agent, activeRuns, pool }),
     keepPending, holdPending: () => pending.hold(topic ? 'chat-1:topic-1' : 'chat-1'),
+    scopeBusy: () => pending.isBlocked(topic ? 'chat-1:topic-1' : 'chat-1'),
   };
   const identity = (await commandSessionCatalogIdentity({
     msg: ctx.msg, scope: ctx.scope, mode: ctx.chatMode, workspaces, controls,
@@ -252,7 +271,7 @@ async function harness(topic = false, metadata: AgentEvent[] = []) {
     await tmp.cleanup();
   });
   return {
-    ctx, agent, compact, activeRuns, pool, catalog, identity, sessions, channel, keepPending, finish,
+    ctx, agent, compact, activeRuns, pool, catalog, identity, sessions, channel, keepPending, finish, pending,
     run: (content: string) => tryHandleCommand({ ...ctx, msg: { ...ctx.msg, content } }),
     markdown: () => (channel.sent.at(-1)?.content as { markdown: string } | undefined)?.markdown ?? '',
   };
