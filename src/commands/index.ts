@@ -57,11 +57,13 @@ import { buildEncryptedAccountConfig } from '../config/store';
 import * as configOps from '../config/config-ops';
 import { log, reportMetric } from '../core/logger';
 import { renderCard } from '../card/run-renderer';
+import { renderFooterMeta } from '../card/run-footer';
 import {
   finalizeIfRunning,
   initialState,
   markInterrupted,
   reduce,
+  withMeta,
   type RunState,
 } from '../card/run-state';
 import { formatRelTime, listRecentSessions, type SessionSummary } from '../session/history';
@@ -427,8 +429,16 @@ async function handleCompact(args: string, ctx: CommandContext): Promise<void> {
     // strand a process without an event consumer. The adapter owns its timeout.
     const completion = (async (): Promise<string> => {
       let outcome = '❌ 未收到压缩完成确认，请稍后重试。';
+      let state = initialState;
+      let succeeded = false;
       for await (const event of execution.subscribe()) {
+        if (event.type === 'system') {
+          state = withMeta(state, { model: event.model, effort: event.effort });
+        } else if (event.type === 'usage') {
+          state = withMeta(state, { contextTokens: event.contextTokens, contextWindow: event.contextWindow });
+        }
         if (event.type === 'done') {
+          succeeded = event.terminationReason === 'normal';
           outcome = event.terminationReason === 'normal'
             ? '✓ 当前会话上下文已压缩，可以继续对话。'
             : '已停止压缩。';
@@ -440,7 +450,15 @@ async function handleCompact(args: string, ctx: CommandContext): Promise<void> {
               : '❌ 压缩失败，请用 `/doctor` 检查 Codex 登录及版本是否支持原生压缩。';
         }
       }
-      return execution.handle.interrupted ? '已停止压缩。' : outcome;
+      if (execution.handle.interrupted) return '已停止压缩。';
+      if (!succeeded) return outcome;
+      const footer = renderFooterMeta(state.meta);
+      const unavailable = [
+        ...(state.meta?.contextTokens === undefined ? ['context 未返回'] : []),
+        ...(!state.meta?.model ? ['模型未返回'] : []),
+      ];
+      const status = [footer, ...unavailable].filter(Boolean).join(' · ');
+      return `${outcome}\n\n---\n${footer ? status : `🧠 ${status}`}`;
     })();
     // Attach rejection handling immediately, even while the acknowledgement is
     // awaiting the network. Do not copy raw CLI errors into a group chat.

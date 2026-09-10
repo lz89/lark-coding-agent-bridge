@@ -165,6 +165,8 @@ DMs do not require an @ mention. Groups and topic groups require `@bot` by defau
 
 `/compact` takes no arguments and applies only to the current chat or topic's compatible Codex session. It uses the configured Codex binary and home through the native [app-server compaction API](https://developers.openai.com/codex/app-server#trigger-thread-compaction); no tmux is required. Wait for an active task to finish before using it. New messages remain queued during compaction, and `/stop` cancels it. The bridge waits for completion (up to five minutes), keeps the session ID, and reports failures without resetting the session. This requires a Codex version supporting `thread/compact/start`; Claude and profiles with `codex.ignoreUserConfig: true` are currently unsupported.
 
+Successful `/compact` replies include the reported context usage, window percentage, model, and reasoning effort. Missing context or model data is marked as unavailable; lifetime token totals are never substituted for current context.
+
 ## Goal mode (`/goal`)
 
 A headless `claude -p` / `codex exec` run is one-shot. When the turn ends the process is gone, so anything the agent promised to do "afterwards" never happens — and a job it detached with `nohup` survives only to *notify*, never to check the result and decide what to do next. Work that genuinely needs several rounds has nowhere to live.

@@ -164,6 +164,8 @@ lark-channel-bridge profile export <name> --include-secrets --yes
 
 `/compact` 不带参数，只压缩当前聊天或话题下兼容的 Codex 会话。它通过配置的 Codex binary 和 home 调用原生 [app-server 压缩接口](https://developers.openai.com/codex/app-server#trigger-thread-compaction)，无需 tmux。请等当前任务结束后使用；压缩期间新消息继续排队，可用 `/stop` 取消。bridge 最多等待五分钟，收到完成事件后才报告成功，保留会话 ID；失败不会重置会话。需要 Codex 版本支持 `thread/compact/start`，暂不支持 Claude 和启用了 `codex.ignoreUserConfig: true` 的 profile。
 
+`/compact` 完成消息会展示服务端返回的 context 用量、窗口占比、模型和推理强度。context 或模型缺失时明确标注“未返回”，不会用累计 token 用量代替当前上下文。
+
 ## 回复展示与 COT
 
 `/config` 可以调整三类展示选项：

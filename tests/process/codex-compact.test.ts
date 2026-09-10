@@ -35,6 +35,35 @@ describe('Codex native compaction process', () => {
     expect(await collect(h.run())).toEqual([{ type: 'done', threadId: 'thread-1', terminationReason: 'normal' }]);
   });
 
+  it('emits actual model and the final context usage before completion, ignoring other turns and lifetime totals', async () => {
+    const h = await fakeServer('telemetry');
+    expect(await collect(h.run())).toEqual([
+      { type: 'system', model: 'gpt-6-astra', effort: 'high' },
+      { type: 'usage', contextTokens: 16_000, contextWindow: 258_400 },
+      { type: 'done', threadId: 'thread-1', terminationReason: 'normal' },
+    ]);
+  });
+
+  it.each(['telemetry-invalid', 'telemetry-total-only'])('drops stale usage when the final report is %s', async (mode) => {
+    const h = await fakeServer(mode);
+    const events = await collect(h.run());
+    expect(events).toContainEqual({ type: 'system', model: 'gpt-6-astra', effort: 'high' });
+    expect(events.some((event) => event.type === 'usage')).toBe(false);
+    expect(events.at(-1)).toMatchObject({ type: 'done', terminationReason: 'normal' });
+  });
+
+  it('keeps a reported zero context usage', async () => {
+    const h = await fakeServer('telemetry-zero');
+    expect(await collect(h.run())).toContainEqual({ type: 'usage', contextTokens: 0, contextWindow: 258_400 });
+  });
+
+  it('does not present failed compaction usage as post-compaction context', async () => {
+    const h = await fakeServer('telemetry-failed');
+    const events = await collect(h.run());
+    expect(events.some((event) => event.type === 'usage')).toBe(false);
+    expect(events.at(-1)).toMatchObject({ type: 'error', terminationReason: 'failed' });
+  });
+
   it.each(['ack-only', 'item-only', 'wrong-thread', 'wrong-turn'])('does not report success for %s', async (mode) => {
     const h = await fakeServer(mode);
     const run = h.run(1000);
@@ -104,7 +133,10 @@ rl.on('line', (line) => {
   messages.push(m);
   writeFileSync(${JSON.stringify(recordPath)}, JSON.stringify({ argv: process.argv.slice(2), home: process.env.CODEX_HOME, messages }));
   if (m.method === 'initialize') send({ id: m.id, result: { userAgent: 'fake' } });
-  if (m.method === 'thread/resume') send({ id: m.id, result: { thread: { id: mode === 'wrong-resume' ? 'other' : m.params.threadId } } });
+  if (m.method === 'thread/resume') send({ id: m.id, result: {
+    thread: { id: mode === 'wrong-resume' ? 'other' : m.params.threadId },
+    ...(mode.startsWith('telemetry') ? { model: 'gpt-6-astra', reasoningEffort: 'high' } : {}),
+  } });
   if (m.method !== 'thread/compact/start') return;
   if (mode === 'rpc-error') { send({ id: m.id, error: { code: -32601, message: 'Method not found' } }); return; }
   if (mode === 'malformed') { console.log('bad-json'); return; }
@@ -118,9 +150,22 @@ rl.on('line', (line) => {
   send({ method: 'turn/started', params: { threadId, turn: { id: turnId, status: 'inProgress', items: [] } } });
   const item = { type: 'contextCompaction', id: 'compact-item' };
   send({ method: 'item/started', params: { threadId, turnId, item } });
+  if (mode.startsWith('telemetry')) {
+    const usage = (totalTokens, tid = turnId, thread = threadId) => send({
+      method: 'thread/tokenUsage/updated', params: { threadId: thread, turnId: tid, tokenUsage: {
+        last: totalTokens === undefined ? undefined : { totalTokens, cachedInputTokens: 10_000 },
+        total: { totalTokens: 2_000_000 }, modelContextWindow: 258_400,
+      } },
+    });
+    usage(90_000);
+    usage(mode === 'telemetry-invalid' ? -1 : mode === 'telemetry-total-only' ? undefined : mode === 'telemetry-zero' ? 0 : 16_000);
+    usage(700_000, turnId, 'unrelated-thread');
+    usage(800_000, 'old-turn');
+  }
   send({ method: 'item/completed', params: { threadId, turnId: mode === 'wrong-turn' ? 'other' : turnId, item } });
   if (mode === 'item-only') return;
-  send({ method: 'turn/completed', params: { threadId, turn: { id: turnId, status: mode === 'failed' ? 'failed' : 'completed', error: mode === 'failed' ? { message: 'model unavailable' } : null, items: [item] } } });
+  const failed = mode === 'failed' || mode === 'telemetry-failed';
+  send({ method: 'turn/completed', params: { threadId, turn: { id: turnId, status: failed ? 'failed' : 'completed', error: failed ? { message: 'model unavailable' } : null, items: [item] } } });
   if (mode === 'late-ack') send({ id: m.id, result: {} });
 });
 `, 'utf8');

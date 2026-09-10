@@ -43,6 +43,10 @@ export function startCodexCompaction(input: {
   let turnId: string | undefined;
   let compacted = false;
   let completed = false;
+  let model: string | undefined;
+  let effort: string | undefined;
+  let contextTokens: number | undefined;
+  let contextWindow: number | undefined;
   let stderr = '';
   let resolveResult!: (event: AgentEvent) => void;
   const result = new Promise<AgentEvent>((resolve) => { resolveResult = resolve; });
@@ -150,6 +154,10 @@ export function startCodexCompaction(input: {
           fail('Codex resumed a different thread');
           return;
         }
+        // These are the effective settings returned by Codex, not requested
+        // profile defaults (which may differ from the resumed session).
+        model = typeof response.model === 'string' ? response.model : undefined;
+        effort = typeof response.reasoningEffort === 'string' ? response.reasoningEffort : undefined;
         stage = 3;
         send({ id: 3, method: 'thread/compact/start', params: { threadId: opts.threadId } });
       } else {
@@ -164,6 +172,15 @@ export function startCodexCompaction(input: {
     const turn = record(params.turn);
     if (message.method === 'turn/started' && typeof turn?.id === 'string' && !turnId) {
       turnId = turn.id;
+    }
+    if (message.method === 'thread/tokenUsage/updated' && turnId && params.turnId === turnId) {
+      const usage = record(params.tokenUsage);
+      // The latest update for this compaction turn is the current context.
+      // `total` is lifetime usage; cached input is already included in `last`.
+      // Replace rather than merge so an invalid later report cannot leave an
+      // earlier, pre-compaction measurement looking current.
+      contextTokens = tokenCount(record(usage?.last)?.totalTokens);
+      contextWindow = tokenCount(usage?.modelContextWindow);
     }
     if (message.method === 'error' && params.willRetry !== true) {
       fail(`Codex compaction failed: ${String(record(params.error)?.message ?? 'unknown error')}`);
@@ -192,7 +209,17 @@ export function startCodexCompaction(input: {
 
   return {
     runId: opts.runId,
-    events: { async *[Symbol.asyncIterator]() { yield await result; } },
+    events: {
+      async *[Symbol.asyncIterator]() {
+        const terminal = await result;
+        if (model || effort) yield { type: 'system' as const, model, effort };
+        if (terminal.type === 'done' && terminal.terminationReason === 'normal' && contextTokens !== undefined) {
+          yield { type: 'usage' as const, contextTokens, contextWindow };
+        }
+        // Consumers stop at the terminal event, so metadata must precede it.
+        yield terminal;
+      },
+    },
     async stop() {
       finish({ type: 'done', threadId: opts.threadId, terminationReason: 'interrupted' });
       await shutdown(false);
@@ -211,4 +238,9 @@ export function startCodexCompaction(input: {
 function record(value: unknown): RecordValue | undefined {
   return value !== null && typeof value === 'object' && !Array.isArray(value)
     ? value as RecordValue : undefined;
+}
+
+function tokenCount(value: unknown): number | undefined {
+  return typeof value === 'number' && Number.isSafeInteger(value) && value >= 0 && value <= 100_000_000
+    ? value : undefined;
 }

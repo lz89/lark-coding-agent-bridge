@@ -22,6 +22,29 @@ afterEach(async () => {
 });
 
 describe('/compact command', () => {
+  it('includes the model, effort and compacted context in the success reply footer', async () => {
+    const h = await harness(false, [
+      { type: 'system', model: 'gpt-6-astra', effort: 'high' },
+      { type: 'usage', contextTokens: 16_000, contextWindow: 258_400 },
+    ]);
+    const task = h.run('/compact');
+    await vi.waitFor(() => expect(h.compact).toHaveBeenCalledTimes(1));
+    expect(h.markdown()).not.toContain('🧠');
+    h.finish({ type: 'done', threadId: 'thread-1', terminationReason: 'normal' });
+    await task;
+    expect(h.markdown()).toBe('✓ 当前会话上下文已压缩，可以继续对话。\n\n---\n🧠 16K / 6% · gpt-6-astra · high');
+  });
+
+  it('marks missing telemetry explicitly without substituting profile defaults', async () => {
+    const h = await harness(false, [{ type: 'system', model: 'gpt-6-astra' }]);
+    const task = h.run('/compact');
+    await vi.waitFor(() => expect(h.compact).toHaveBeenCalledTimes(1));
+    h.finish({ type: 'done', terminationReason: 'normal' });
+    await task;
+    expect(h.markdown()).toContain('🧠 gpt-6-astra · context 未返回');
+    expect(h.markdown()).not.toContain('0%');
+  });
+
   it('uses the catalog thread and executor, retains queued messages and preserves the session', async () => {
     const h = await harness();
     const before = h.catalog.activeFor(h.identity);
@@ -38,6 +61,7 @@ describe('/compact command', () => {
     h.finish({ type: 'done', threadId: 'thread-1', terminationReason: 'normal' });
     await task;
     expect(h.markdown()).toContain('上下文已压缩');
+    expect(h.markdown()).toContain('🧠 context 未返回 · 模型未返回');
     expect(h.catalog.activeFor(h.identity)).toEqual(before);
     expect(h.sessions.getRaw(h.ctx.scope)).toBeUndefined();
     expect(h.activeRuns.get(h.ctx.scope)).toBeUndefined();
@@ -172,7 +196,7 @@ describe('maintenance queue holds', () => {
   });
 });
 
-async function harness(topic = false) {
+async function harness(topic = false, metadata: AgentEvent[] = []) {
   const tmp = await createTmpProfile('compact-command-');
   const channel = createFakeChannel();
   const sessions = new SessionStore(join(tmp.profile, 'sessions.json'));
@@ -195,7 +219,7 @@ async function harness(topic = false) {
   const completion = new Promise<AgentEvent>((resolve) => { finish = resolve; });
   const compact = vi.fn((opts: AgentRunOptions) => ({
     runId: opts.runId,
-    events: { async *[Symbol.asyncIterator]() { yield await completion; } },
+    events: { async *[Symbol.asyncIterator]() { yield* metadata; yield await completion; } },
     stop: async () => { finish({ type: 'done', terminationReason: 'interrupted' }); },
     waitForExit: async () => true,
   }));
