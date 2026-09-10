@@ -17,6 +17,7 @@ export interface RunExecutorDeps {
 }
 
 export interface SubmitRunInput {
+  operation?: 'compact';
   scopeId: string;
   policy: RunPolicyAllow;
   sessionId?: string;
@@ -142,7 +143,12 @@ export class RunExecutor {
       );
     }
     try {
-      run = this.agent.run(runOptions);
+      if (input.operation === 'compact') {
+        if (!this.agent.compact) throw new Error('agent does not support native compaction');
+        run = this.agent.compact(runOptions);
+      } else {
+        run = this.agent.run(runOptions);
+      }
     } catch (err) {
       release();
       releaseScope();

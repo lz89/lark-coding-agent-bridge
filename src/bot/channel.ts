@@ -867,6 +867,7 @@ async function intakeMessage(deps: IntakeDeps): Promise<void> {
     keepPending: () => {
       keepPending = true;
     },
+    holdPending: () => pending.hold(scope),
     sessions,
     workspaces,
     agent,

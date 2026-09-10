@@ -23,6 +23,7 @@ export type FlushHandler = (scope: string, batch: NormalizedMessage[]) => void;
 export class PendingQueue {
   private readonly map = new Map<string, PendingEntry>();
   private readonly blocked = new Set<string>();
+  private readonly holds = new Map<string, Set<symbol>>();
   private readonly delayMs: number;
   private readonly onFlush: FlushHandler;
 
@@ -36,12 +37,12 @@ export class PendingQueue {
     if (existing) {
       if (existing.timer) clearTimeout(existing.timer);
       existing.messages.push(msg);
-      existing.timer = this.blocked.has(scope) ? undefined : this.armTimer(scope);
+      existing.timer = this.isBlocked(scope) ? undefined : this.armTimer(scope);
       return existing.messages.length;
     }
     this.map.set(scope, {
       messages: [msg],
-      timer: this.blocked.has(scope) ? undefined : this.armTimer(scope),
+      timer: this.isBlocked(scope) ? undefined : this.armTimer(scope),
     });
     return 1;
   }
@@ -60,6 +61,30 @@ export class PendingQueue {
     }
     this.map.clear();
     this.blocked.clear();
+    this.holds.clear();
+  }
+
+  /** Independently hold messages during maintenance without releasing a run's block. */
+  hold(scope: string): () => void {
+    const tokens = this.holds.get(scope) ?? new Set<symbol>();
+    const token = Symbol();
+    tokens.add(token);
+    this.holds.set(scope, tokens);
+    const entry = this.map.get(scope);
+    if (entry?.timer) { clearTimeout(entry.timer); entry.timer = undefined; }
+    return () => {
+      if (!tokens.delete(token) || this.holds.get(scope) !== tokens) return;
+      if (tokens.size === 0) this.holds.delete(scope);
+      const pending = this.map.get(scope);
+      if (!this.isBlocked(scope) && pending?.messages.length) {
+        if (pending.timer) clearTimeout(pending.timer);
+        pending.timer = this.armTimer(scope);
+      }
+    };
+  }
+
+  private isBlocked(scope: string): boolean {
+    return this.blocked.has(scope) || this.holds.has(scope);
   }
 
   /** Pause the debounce timer; pushed messages keep accumulating. */
@@ -80,7 +105,7 @@ export class PendingQueue {
     this.blocked.delete(scope);
     const entry = this.map.get(scope);
     log.info('queue', 'unblocked', { scope, queued: entry?.messages.length ?? 0 });
-    if (!entry || entry.messages.length === 0) return;
+    if (!entry || entry.messages.length === 0 || this.isBlocked(scope)) return;
     if (entry.timer) clearTimeout(entry.timer);
     entry.timer = this.armTimer(scope);
   }
