@@ -5,9 +5,9 @@ const cfg = (preferences: Record<string, unknown> = {}): AppConfig =>
   ({ preferences }) as unknown as AppConfig;
 
 describe('receipt reaction config', () => {
-  it('is on by default, with the 收到 sticker', () => {
+  it('is on by default, with the pushpin', () => {
     expect(getAckReaction(cfg())).toBe(DEFAULT_ACK_REACTION);
-    expect(getAckReaction({} as AppConfig)).toBe('Get');
+    expect(getAckReaction({} as AppConfig)).toBe('Pin');
   });
 
   it('turns off on false, "off" (any case) and an empty value', () => {
@@ -23,8 +23,8 @@ describe('receipt reaction config', () => {
   });
 
   it('falls back to the default on a value of the wrong shape', () => {
-    expect(getAckReaction(cfg({ ackReaction: null }))).toBe('Get');
-    expect(getAckReaction(cfg({ ackReaction: 1 }))).toBe('Get');
-    expect(getAckReaction(cfg({ ackReaction: true }))).toBe('Get');
+    expect(getAckReaction(cfg({ ackReaction: null }))).toBe('Pin');
+    expect(getAckReaction(cfg({ ackReaction: 1 }))).toBe('Pin');
+    expect(getAckReaction(cfg({ ackReaction: true }))).toBe('Pin');
   });
 });

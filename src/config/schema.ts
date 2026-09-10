@@ -110,8 +110,9 @@ export interface AppPreferences {
   /**
    * The reaction the bot puts on every message it takes on — the one that
    * starts a run, one queued behind a run, one handed to a run in flight —
-   * the moment it is accepted. A Feishu reaction `emoji_type` (`'Get'` is
-   * the 收到 / GET sticker, the default; `'OK'`, `'THUMBSUP'`, … also work).
+   * the moment it is accepted. A Feishu reaction `emoji_type`: `'Pin'` (📌)
+   * is the default; `'Get'` (the 收到 / GET sticker), `'OK'`, `'THUMBSUP'`, …
+   * also work.
    * `false` or `'off'` turns it off. Taken back should the bridge let the
    * message go unhandled (`/stop`, a queue-dropping command, a run that could
    * not start), so a mark that stays means the message reached the agent or
@@ -263,8 +264,8 @@ export function getShowToolCalls(cfg: AppConfig): boolean {
   return cfg.preferences?.showToolCalls !== false;
 }
 
-/** The receipt reaction a fresh config uses: Feishu's 收到 / GET sticker. */
-export const DEFAULT_ACK_REACTION = 'Get';
+/** The receipt reaction a fresh config uses: Feishu's 📌 pushpin. */
+export const DEFAULT_ACK_REACTION = 'Pin';
 
 /**
  * Resolve the receipt-reaction preference: the `emoji_type` to put on each

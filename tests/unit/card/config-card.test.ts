@@ -7,7 +7,7 @@ const base: ConfigFormOpts = {
   model: 'default',
   messageReply: 'markdown',
   showToolCalls: false,
-  ackReaction: 'Get',
+  ackReaction: 'Pin',
   cotMessages: 'off',
   maxConcurrentRuns: 1,
   runIdleTimeoutMinutes: 0,
@@ -53,8 +53,8 @@ function findSelect(card: object, name: string): Select {
 describe('configFormCard receipt reaction picker', () => {
   it('offers the stickers that read as "got it", plus off, with the current one selected', () => {
     const select = findSelect(configFormCard(base), 'ack_reaction');
-    expect(select.initial_option).toBe('Get');
-    expect(select.options!.map((o) => o.value)).toEqual(['Get', 'OK', 'THUMBSUP', 'off']);
+    expect(select.initial_option).toBe('Pin');
+    expect(select.options!.map((o) => o.value)).toEqual(['Pin', 'Get', 'OK', 'THUMBSUP', 'off']);
   });
 
   it('shows the receipt as off when it is', () => {
@@ -65,11 +65,11 @@ describe('configFormCard receipt reaction picker', () => {
   it('lists a hand-configured emoji as itself, so re-submitting keeps it', () => {
     const select = findSelect(configFormCard({ ...base, ackReaction: 'OnIt' }), 'ack_reaction');
     expect(select.initial_option).toBe('OnIt');
-    expect(select.options!.map((o) => o.value)).toEqual(['OnIt', 'Get', 'OK', 'THUMBSUP', 'off']);
+    expect(select.options!.map((o) => o.value)).toEqual(['OnIt', 'Pin', 'Get', 'OK', 'THUMBSUP', 'off']);
   });
 
   it('is echoed on the saved card', () => {
-    expect(JSON.stringify(configSavedCard(base))).toContain('**收到回执**:`Get`');
+    expect(JSON.stringify(configSavedCard(base))).toContain('**收到回执**:`Pin`');
     expect(JSON.stringify(configSavedCard({ ...base, ackReaction: undefined }))).toContain(
       '**收到回执**:`关闭`',
     );

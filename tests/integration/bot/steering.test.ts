@@ -757,7 +757,7 @@ describe('the receipt: a reaction the moment a message is accepted', () => {
 
     // Accepted: marked before the quiet window has even elapsed.
     await h.channel.handlers.message?.(message('om_1', 'go'));
-    expect(marks(h)).toEqual(['om_1:Get']);
+    expect(marks(h)).toEqual(['om_1:Pin']);
     await vi.advanceTimersByTimeAsync(DEBOUNCE_MS + 50);
     await waitForRun(h, 1);
     await emit(h, { type: 'text', delta: '…' });
@@ -765,7 +765,7 @@ describe('the receipt: a reaction the moment a message is accepted', () => {
     // A follow-up handed to the running turn: marked at intake, well before
     // the agent's receipt — and the mark stays once it is taken in.
     await sendMidRun(h, message('om_2', '改成蓝色'));
-    expect(marks(h)).toEqual(['om_1:Get', 'om_2:Get']);
+    expect(marks(h)).toEqual(['om_1:Pin', 'om_2:Pin']);
     const steer = h.agent.sends[0]!;
     await emit(h, { type: 'user_input', uuid: steer.uuid, text: steer.text });
 
@@ -773,7 +773,7 @@ describe('the receipt: a reaction the moment a message is accepted', () => {
     // message that is already in the agent.
     await h.channel.handlers.message?.(message('om_3', '/help'));
     await settle();
-    expect(marks(h)).toEqual(['om_1:Get', 'om_2:Get']);
+    expect(marks(h)).toEqual(['om_1:Pin', 'om_2:Pin']);
 
     await finishRun(h);
     expect(withdrawn(h)).toEqual([]);
@@ -790,7 +790,7 @@ describe('the receipt: a reaction the moment a message is accepted', () => {
     await sendMidRun(h, message('om_2', '排队的'));
     // Still inside its quiet window.
     await h.channel.handlers.message?.(message('om_3', '还在防抖里'));
-    expect(marks(h)).toEqual(['om_1:Get', 'om_2:Get', 'om_3:Get']);
+    expect(marks(h)).toEqual(['om_1:Pin', 'om_2:Pin', 'om_3:Pin']);
 
     await h.channel.handlers.message?.(message('om_4', '/stop'));
     await settle();
@@ -798,7 +798,7 @@ describe('the receipt: a reaction the moment a message is accepted', () => {
     await settle();
 
     // The trigger was handled (and stopped): its mark stays.
-    expect([...withdrawn(h)].sort()).toEqual(['om_2:Get', 'om_3:Get']);
+    expect([...withdrawn(h)].sort()).toEqual(['om_2:Pin', 'om_3:Pin']);
     expect(h.agent.runOptions).toHaveLength(1);
   });
 
@@ -818,7 +818,7 @@ describe('the receipt: a reaction the moment a message is accepted', () => {
     await settle();
     await vi.advanceTimersByTimeAsync(DEBOUNCE_MS * 3);
     await settle();
-    expect(withdrawn(h)).toEqual(['om_2:Get']);
+    expect(withdrawn(h)).toEqual(['om_2:Pin']);
     expect(h.agent.runOptions).toHaveLength(1);
   });
 
@@ -831,13 +831,13 @@ describe('the receipt: a reaction the moment a message is accepted', () => {
     vi.useFakeTimers();
 
     await h.channel.handlers.message?.(message('om_1', 'go'));
-    expect(marks(h)).toEqual(['om_1:Get']);
+    expect(marks(h)).toEqual(['om_1:Pin']);
     await vi.advanceTimersByTimeAsync(DEBOUNCE_MS + 50);
     for (let i = 0; i < 200 && h.channel.withdrawn.length === 0; i++) {
       await vi.advanceTimersByTimeAsync(20);
       await settle();
     }
-    expect(withdrawn(h)).toEqual(['om_1:Get']);
+    expect(withdrawn(h)).toEqual(['om_1:Pin']);
     expect(h.agent.runOptions).toHaveLength(0);
     expect(JSON.stringify(h.channel.sent)).toContain('lcb-receipt-test');
   });
@@ -848,7 +848,7 @@ describe('the receipt: a reaction the moment a message is accepted', () => {
     vi.useFakeTimers();
 
     await startRun(h, message('om_1', 'go'));
-    expect(marks(h)).toEqual(['om_1:Get']);
+    expect(marks(h)).toEqual(['om_1:Pin']);
     expect(withdrawn(h)).toEqual([]);
 
     // What the adapter yields when the binary is gone: no init, no output.
@@ -861,7 +861,7 @@ describe('the receipt: a reaction the moment a message is accepted', () => {
       await vi.advanceTimersByTimeAsync(20);
       await settle();
     }
-    expect(withdrawn(h)).toEqual(['om_1:Get']);
+    expect(withdrawn(h)).toEqual(['om_1:Pin']);
   });
 
   it('stays on a message the agent did run on, however the run ended', async () => {
@@ -886,7 +886,7 @@ describe('the receipt: a reaction the moment a message is accepted', () => {
     await vi.advanceTimersByTimeAsync(DEBOUNCE_MS * 3);
     await settle();
     expect(withdrawn(h)).toEqual([]);
-    expect(marks(h)).toEqual(['om_1:Get', 'om_2:Get']);
+    expect(marks(h)).toEqual(['om_1:Pin', 'om_2:Pin']);
   });
 
   it('can be turned off, or set to another sticker', async () => {

@@ -392,7 +392,8 @@ export function configSavedCard(opts: ConfigFormOpts): object {
  */
 function ackReactionOptions(current: string | undefined): object[] {
   const options = [
-    { text: { tag: 'plain_text', content: 'GET / 收到(默认)' }, value: 'Get' },
+    { text: { tag: 'plain_text', content: '📌 图钉(默认)' }, value: 'Pin' },
+    { text: { tag: 'plain_text', content: 'GET / 收到' }, value: 'Get' },
     { text: { tag: 'plain_text', content: 'OK' }, value: 'OK' },
     { text: { tag: 'plain_text', content: '👍' }, value: 'THUMBSUP' },
     { text: { tag: 'plain_text', content: '关闭' }, value: 'off' },

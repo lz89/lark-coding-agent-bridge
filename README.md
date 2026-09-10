@@ -232,11 +232,11 @@ One thing steering deliberately does **not** do is reset the watchdogs. Your mes
 
 ## Receipt reaction (收到)
 
-Every message the bridge takes on gets a reaction the moment it is accepted — the Feishu **GET / 收到** sticker by default. That covers the message that starts a run, but the point is the other two: a message queued behind a run, and a follow-up handed to a run in flight. Neither shows anything else until the agent gets to it, and a follow-up sitting there for a minute otherwise looks exactly like one that never arrived. The mark is what tells them apart.
+Every message the bridge takes on gets a reaction the moment it is accepted — a 📌 pushpin by default. That covers the message that starts a run, but the point is the other two: a message queued behind a run, and a follow-up handed to a run in flight. Neither shows anything else until the agent gets to it, and a follow-up sitting there for a minute otherwise looks exactly like one that never arrived. The mark is what tells them apart.
 
 The mark is honest in the other direction too: if the bridge lets a message go without handling it — `/stop` or another queue-dropping command drops it, or the run it was waiting for cannot start — the reaction is taken back. A mark that stays means the message reached the agent, or still will. Commands are not marked; their reply is the receipt.
 
-Pick the sticker, or turn it off, under **收到回执** in `/config`, or set `preferences.ackReaction` in `config.json` to any Feishu reaction `emoji_type` (`"Get"`, `"OK"`, `"THUMBSUP"`, …) or `false`.
+Pick the sticker, or turn it off, under **收到回执** in `/config`, or set `preferences.ackReaction` in `config.json` to any Feishu reaction `emoji_type` (`"Pin"`, `"Get"`, `"OK"`, `"THUMBSUP"`, …) or `false`. The receipt is put on at intake, before any agent is involved, so Claude and Codex profiles get it alike.
 
 ## Reply Display and COT
 
