@@ -105,6 +105,8 @@ export interface AgentAdapter {
   checkAvailability?(): Promise<AgentAvailability>;
   prepareRun?(opts: AgentRunOptions): Promise<void>;
   run(opts: AgentRunOptions): AgentRun;
+  /** Native history compaction, without submitting a user prompt. */
+  compact?(opts: AgentRunOptions): AgentRun;
   /**
    * Late-bound identity injection: the adapter is constructed before the
    * channel connects, so the channel calls this once botIdentity is known.

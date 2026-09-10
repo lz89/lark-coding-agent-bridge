@@ -138,6 +138,7 @@ lark-channel-bridge profile export <name> --include-secrets --yes
 | 命令 | 作用 |
 |---|---|
 | `/new`, `/reset` | 清空当前会话 |
+| `/compact` | 压缩当前 Codex 会话上下文，保留会话 ID（仅任务空闲时可用） |
 | `/cd <path>` | 切换工作目录并重置会话 |
 | `/ws list` | 列出命名工作空间 |
 | `/ws save <name>` | 把当前工作目录保存为命名工作空间 |
@@ -160,6 +161,8 @@ lark-channel-bridge profile export <name> --include-secrets --yes
 | `/help` | 帮助卡片 |
 
 私聊不需要 @。群和话题群默认必须 `@bot`；`@all` 会被忽略。支持的云文档评论里 @bot 就会触发回复。
+
+`/compact` 不带参数，只压缩当前聊天或话题下兼容的 Codex 会话。它通过配置的 Codex binary 和 home 调用原生 [app-server 压缩接口](https://developers.openai.com/codex/app-server#trigger-thread-compaction)，无需 tmux。请等当前任务结束后使用；压缩期间新消息继续排队，可用 `/stop` 取消。bridge 最多等待五分钟，收到完成事件后才报告成功，保留会话 ID；失败不会重置会话。需要 Codex 版本支持 `thread/compact/start`，暂不支持 Claude 和启用了 `codex.ignoreUserConfig: true` 的 profile。
 
 ## 回复展示与 COT
 
