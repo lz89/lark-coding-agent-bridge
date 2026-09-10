@@ -4,7 +4,7 @@ import type { ClaudePermissionMode, CodexSandboxMode } from '../config/permissio
 export type { ClaudePermissionMode } from '../config/permissions';
 
 export type AgentEvent =
-  | { type: 'system'; sessionId?: string; threadId?: string; cwd?: string; model?: string }
+  | { type: 'system'; sessionId?: string; threadId?: string; cwd?: string; model?: string; effort?: string }
   | { type: 'text'; delta: string }
   | { type: 'final_text'; content: string }
   | { type: 'thinking'; delta: string }
@@ -140,6 +140,8 @@ export interface AgentAdapter {
   checkAvailability?(): Promise<AgentAvailability>;
   prepareRun?(opts: AgentRunOptions): Promise<void>;
   run(opts: AgentRunOptions): AgentRun;
+  /** Native history compaction, without submitting a user prompt. */
+  compact?(opts: AgentRunOptions): AgentRun;
   /**
    * Late-bound identity injection: the adapter is constructed before the
    * channel connects, so the channel calls this once botIdentity is known.

@@ -138,6 +138,7 @@ If a profile was created with the wrong agent kind, stop or unregister any match
 | Command | Effect |
 |---|---|
 | `/new`, `/reset` | Clear the current session |
+| `/compact` | Compact the current Codex session's context while keeping its session ID (idle sessions only) |
 | `/cd <path>` | Switch working directory and reset the session |
 | `/ws list` | List named workspaces |
 | `/ws save <name>` | Save the current working directory as a named workspace |
@@ -161,6 +162,10 @@ If a profile was created with the wrong agent kind, stop or unregister any match
 | `/help` | Help card |
 
 DMs do not require an @ mention. Groups and topic groups require `@bot` by default; `@all` is ignored. Cloud-doc comments in supported document types run when the bot is mentioned.
+
+`/compact` takes no arguments and applies only to the current chat or topic's compatible Codex session. It uses the configured Codex binary and home through the native [app-server compaction API](https://developers.openai.com/codex/app-server#trigger-thread-compaction); no tmux is required. Wait for an active task to finish before using it. New messages remain queued during compaction, and `/stop` cancels it. The bridge waits for completion (up to five minutes), keeps the session ID, and reports failures without resetting the session. This requires a Codex version supporting `thread/compact/start`; Claude and profiles with `codex.ignoreUserConfig: true` are currently unsupported.
+
+Successful `/compact` replies include the reported context usage, window percentage, model, and reasoning effort. Missing context or model data is marked as unavailable; lifetime token totals are never substituted for current context.
 
 ## Goal mode (`/goal`)
 

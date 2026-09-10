@@ -1,6 +1,7 @@
 import { createInterface } from 'node:readline';
 import type { Readable, Writable } from 'node:stream';
 import { join } from 'node:path';
+import { homedir } from 'node:os';
 import type { SandboxMode } from '../../config/profile-schema';
 import { log } from '../../core/logger';
 import { mergeProcessEnv, spawnProcess, type SpawnedProcessByStdio } from '../../platform/spawn';
@@ -18,6 +19,8 @@ import type {
 } from '../types';
 import { buildCodexArgs } from './argv';
 import { CodexJsonlTranslator, type CodexFinishReason } from './jsonl';
+import { readCodexTelemetry } from './telemetry';
+import { startCodexCompaction } from './compact';
 
 export interface CodexAdapterOptions {
   binary: string;
@@ -89,6 +92,30 @@ export class CodexAdapter implements AgentAdapter {
     }
   }
 
+  compact(opts: AgentRunOptions): AgentRun {
+    // app-server has no equivalent of exec's --ignore-user-config. Do not
+    // silently load configuration that this profile explicitly excludes.
+    if (this.ignoreUserConfig) {
+      throw new Error('compact is unavailable when codex.ignoreUserConfig is enabled');
+    }
+    return startCodexCompaction({
+      binary: this.binary,
+      opts: { ...opts, sandbox: opts.sandbox ?? this.sandbox },
+      env: this.processEnv(),
+      stopGraceMs: opts.stopGraceMs ?? this.defaultStopGraceMs,
+    });
+  }
+
+  private processEnv(): NodeJS.ProcessEnv {
+    const overrides: NodeJS.ProcessEnv = buildLarkChannelEnv(this.larkChannel);
+    if (this.codexHome) {
+      overrides.CODEX_HOME = this.codexHome;
+    } else if (!this.inheritCodexHome) {
+      overrides.CODEX_HOME = join(this.profileStateDir, 'codex-home');
+    }
+    return mergeProcessEnv(process.env, overrides);
+  }
+
   run(opts: AgentRunOptions): AgentRun {
     if (!opts.cwd) {
       throw new Error('cwd is required for CodexAdapter.run');
@@ -107,15 +134,12 @@ export class CodexAdapter implements AgentAdapter {
       // it, so the wake-up would never arrive and nothing would say why.
       writableDirs: [wakeDirIn(this.profileStateDir)],
     });
-    const envOverrides: NodeJS.ProcessEnv = buildLarkChannelEnv(this.larkChannel);
-    if (this.codexHome) {
-      envOverrides.CODEX_HOME = this.codexHome;
-    } else if (!this.inheritCodexHome) {
-      envOverrides.CODEX_HOME = join(this.profileStateDir, 'codex-home');
-    }
+    const env = this.processEnv();
+    const startedAt = Date.now();
+    const telemetryHome = env.CODEX_HOME ?? join(homedir(), '.codex');
     const child = spawnProcess(this.binary, args, {
       cwd: opts.cwd,
-      env: mergeProcessEnv(process.env, envOverrides),
+      env,
       stdio: ['pipe', 'pipe', 'pipe'],
     }) as CodexChild;
 
@@ -164,7 +188,7 @@ export class CodexAdapter implements AgentAdapter {
 
     return {
       runId: opts.runId,
-      events: createEventStream(child, stderrChunks, () => runtimeError, () => stopReason),
+      events: createEventStream(child, stderrChunks, () => runtimeError, () => stopReason, telemetryHome, startedAt, opts.threadId),
       async stop() {
         if (child.exitCode !== null || child.signalCode !== null) return;
         stopReason = 'interrupted';
@@ -213,6 +237,9 @@ async function* createEventStream(
   stderrChunks: Buffer[],
   getError: () => Error | null,
   getStopReason: () => CodexFinishReason | undefined,
+  codexHome: string,
+  startedAt: number,
+  threadId?: string,
 ): AsyncGenerator<AgentEvent> {
   const translator = new CodexJsonlTranslator();
   if (!child.pid) {
@@ -245,7 +272,14 @@ async function* createEventStream(
       } catch {
         continue;
       }
-      yield* translator.translate(parsed);
+      const events = translator.translate(parsed);
+      for (const event of events) {
+        if (event.type === 'system' && event.threadId) threadId = event.threadId;
+      }
+      if (events.some((event) => event.type === 'done' || event.type === 'error')) {
+        yield* await readCodexTelemetry(codexHome, threadId, startedAt);
+      }
+      yield* events;
     }
   } finally {
     if (silentExitTimer) clearTimeout(silentExitTimer);

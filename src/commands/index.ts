@@ -58,11 +58,13 @@ import { buildEncryptedAccountConfig } from '../config/store';
 import * as configOps from '../config/config-ops';
 import { log, reportMetric } from '../core/logger';
 import { renderCard } from '../card/run-renderer';
+import { renderFooterMeta } from '../card/run-footer';
 import {
   finalizeIfRunning,
   initialState,
   markInterrupted,
   reduce,
+  withMeta,
   type RunState,
 } from '../card/run-state';
 import { formatRelTime, listRecentSessions, type SessionSummary } from '../session/history';
@@ -168,6 +170,16 @@ export interface CommandContext {
    * next round was about to pick up.
    */
   keepPending?: () => void;
+  /** Pause queued turns until maintenance finishes; independent of run blocking. */
+  holdPending?: () => () => void;
+  /**
+   * Whether a batch of this scope is already being driven — flushed from the
+   * queue and on its way to a run (attachments downloading, policy being
+   * evaluated), or running. `activeRuns` only knows about it once the run is
+   * reserved, and that gap is exactly when a maintenance run would win the
+   * scope and get the user's batch rejected.
+   */
+  scopeBusy?: () => boolean;
 }
 
 type Handler = (args: string, ctx: CommandContext) => Promise<void>;
@@ -190,6 +202,7 @@ const RESUME_APPLIED_REPLY = '已完成，请继续发送下一条消息。';
 const handlers: Record<string, Handler> = {
   '/new': handleNew,
   '/reset': handleNew,
+  '/compact': handleCompact,
   '/cd': handleCd,
   '/ws': handleWs,
   '/resume': handleResume,
@@ -362,6 +375,121 @@ async function handleNew(args: string, ctx: CommandContext): Promise<void> {
   }
   ctx.sessions.clear(ctx.scope);
   await reply(ctx, wasRunning ? '已中断当前任务并开始新会话。' : '已开始新会话。');
+}
+
+async function handleCompact(args: string, ctx: CommandContext): Promise<void> {
+  ctx.keepPending?.();
+  if (args) {
+    await reply(ctx, '用法：`/compact`（不带参数），压缩当前会话上下文。');
+    return;
+  }
+  if (ctx.controls.profileConfig.agentKind !== 'codex' || !ctx.agent.compact) {
+    await reply(ctx, '当前 agent 暂不支持 `/compact`；此命令目前仅支持 Codex。');
+    return;
+  }
+  if (ctx.activeRuns.get(ctx.scope) || ctx.scopeBusy?.()) {
+    await reply(ctx, '当前会话有任务运行中，请等任务结束后重试 `/compact`，或先用 `/stop` 停止。');
+    return;
+  }
+  if (ctx.controls.profileConfig.codex?.ignoreUserConfig) {
+    await reply(ctx, '当前 Codex 配置启用了 ignoreUserConfig，原生压缩接口暂不支持此配置。');
+    return;
+  }
+  const releasePending = ctx.holdPending?.();
+  try {
+    const requestedCwd = effectiveWorkspaceCwd(ctx);
+    if (!requestedCwd) {
+      await reply(ctx, '请先选择工作目录并开始会话，再使用 `/compact`。');
+      return;
+    }
+    const workspace = await resolveWorkingDirectory(requestedCwd);
+    if (!workspace.ok) { await reply(ctx, workspace.userVisible); return; }
+    const profile = ctx.controls.profileConfig;
+    const access = ctx.msg.chatType === 'p2p'
+      ? canUseDm(profile, ctx.controls, ctx.msg.senderId)
+      : canUseGroup(profile, ctx.controls, ctx.msg.chatId, ctx.msg.senderId);
+    const policy = evaluateRunPolicy({
+      scope: {
+        source: 'im', chatId: ctx.msg.chatId, actorId: ctx.msg.senderId,
+        ...(ctx.chatMode === 'topic' && ctx.msg.threadId ? { threadId: ctx.msg.threadId } : {}),
+      },
+      attachments: [], prompt: '', requestedCwd, cwdRealpath: workspace.cwdRealpath,
+      access, capability: codexCapability(profile), profileConfig: profile, now: Date.now(),
+      codexHome: profile.codex?.codexHome, inheritCodexHome: profile.codex?.inheritCodexHome,
+    });
+    if (!policy.ok) { await reply(ctx, policy.rejectReason.userVisible); return; }
+    const identity: SessionCatalogIdentity = {
+      scopeId: ctx.scope, agentId: 'codex', cwdRealpath: workspace.cwdRealpath,
+      policyFingerprint: policy.policyFingerprint,
+    };
+    const entry = ctx.sessionCatalog?.activeFor(identity);
+    if (!entry?.threadId) {
+      await reply(ctx, '当前上下文没有可压缩的 Codex 会话。请先发消息建立会话，或用 `/resume` 恢复。');
+      return;
+    }
+    if (!ctx.runExecutor) { await reply(ctx, '运行器不可用，暂时无法压缩会话。'); return; }
+
+    const execution = await ctx.runExecutor.submit({
+      scopeId: ctx.scope, policy, threadId: entry.threadId, operation: 'compact', nowait: true,
+      stopGraceMs: getAgentStopGraceMs(ctx.controls.cfg),
+      observability: { profile: ctx.controls.profile, agent: 'codex', source: 'im', stage: 'compact' },
+    });
+    // Subscribe before sending the acknowledgement so transport failures never
+    // strand a process without an event consumer. The adapter owns its timeout.
+    const completion = (async (): Promise<string> => {
+      let outcome = '❌ 未收到压缩完成确认，请稍后重试。';
+      let state = initialState;
+      let succeeded = false;
+      for await (const event of execution.subscribe()) {
+        if (event.type === 'system') {
+          state = withMeta(state, { model: event.model, effort: event.effort });
+        } else if (event.type === 'usage') {
+          state = withMeta(state, { contextTokens: event.contextTokens, contextWindow: event.contextWindow });
+        }
+        if (event.type === 'done') {
+          succeeded = event.terminationReason === 'normal';
+          outcome = event.terminationReason === 'normal'
+            ? '✓ 当前会话上下文已压缩，可以继续对话。'
+            : '已停止压缩。';
+        } else if (event.type === 'error') {
+          outcome = event.terminationReason === 'timeout'
+            ? '❌ 压缩超时，请稍后重试。'
+            : event.terminationReason === 'interrupted'
+              ? '已停止压缩。'
+              : '❌ 压缩失败，请用 `/doctor` 检查 Codex 登录及版本是否支持原生压缩。';
+        }
+      }
+      if (execution.handle.interrupted) return '已停止压缩。';
+      if (!succeeded) return outcome;
+      const footer = renderFooterMeta(state.meta);
+      const unavailable = [
+        ...(state.meta?.contextTokens === undefined ? ['context 未返回'] : []),
+        ...(!state.meta?.model ? ['模型未返回'] : []),
+      ];
+      const status = [footer, ...unavailable].filter(Boolean).join(' · ');
+      return `${outcome}\n\n---\n${footer ? status : `🧠 ${status}`}`;
+    })();
+    // Attach rejection handling immediately, even while the acknowledgement is
+    // awaiting the network. Do not copy raw CLI errors into a group chat.
+    const safeCompletion = completion.catch(async (err: unknown) => {
+      log.fail('command', err, { step: 'compact.stream' });
+      await execution.stop().catch((stopErr: unknown) => {
+        log.fail('command', stopErr, { step: 'compact.stop' });
+      });
+      return '❌ 压缩失败，请稍后重试。';
+    });
+    await reply(ctx, '⏳ 正在压缩当前会话上下文；新消息会排队，可用 `/stop` 取消。');
+    await reply(ctx, await safeCompletion);
+  } catch (err) {
+    log.fail('command', err, { step: 'compact' });
+    await reply(ctx, err instanceof RunRejected
+      ? err.code === 'run-already-active'
+        ? '当前会话有任务运行中，请稍后重试 `/compact`。'
+        : '运行资源暂不可用，请稍后重试 `/compact`。'
+      : '❌ 无法启动压缩，请检查 Codex 配置及版本。');
+  } finally {
+    releasePending?.();
+  }
 }
 
 async function handleNewChat(rawName: string, ctx: CommandContext): Promise<void> {

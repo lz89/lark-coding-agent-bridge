@@ -929,6 +929,12 @@ async function intakeMessage(deps: IntakeDeps): Promise<void> {
     keepPending: () => {
       keepPending = true;
     },
+    holdPending: () => pending.hold(scope),
+    // A driver owns the scope from the flush until it returns — while an
+    // attachment downloads as much as while the run goes — and only the
+    // dispatcher map knows that here; the queue's block is not used on this
+    // path.
+    scopeBusy: () => pending.isBlocked(scope) || dispatchers.has(scope),
     sessions,
     workspaces,
     agent,
@@ -2468,7 +2474,7 @@ async function processAgentStream(
         recordSession(evt);
         // Ground truth for the footer: what the CLI actually loaded, which can
         // differ from what was requested (unknown id, account fallback).
-        if (evt.model) state = withMeta(state, { model: evt.model });
+        state = withMeta(state, { model: evt.model, effort: evt.effort });
         continue;
       }
       if (evt.type === 'usage') {
