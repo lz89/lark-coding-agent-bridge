@@ -29,6 +29,10 @@ describe('run footer', () => {
 
   it('degrades field by field rather than dropping the footer', () => {
     expect(renderFooterMeta({ model: 'claude-opus-5' })).toBe('🧠 Opus 5');
+    expect(renderFooterMeta({ model: 'claude-opus-5-5' })).toBe('🧠 Opus 5.5');
+    // Ids newer than any table are still named from their shape.
+    expect(renderFooterMeta({ model: 'claude-opus-9-9' })).toBe('🧠 Opus 9.9');
+    expect(renderFooterMeta({ model: 'claude-fable-5-1[1m]' })).toBe('🧠 Fable 5.1 [1M]');
     expect(renderFooterMeta({ contextTokens: 12_000, effort: 'xhigh' })).toBe('🧠 12K · xhigh');
   });
 
@@ -46,9 +50,10 @@ describe('run footer', () => {
     expect(renderFooterMeta({ contextTokens: 940 })).toBe('🧠 940');
   });
 
-  it('names a model released after this table was written', () => {
-    // Better a plain id than a nameless footer.
-    expect(prettyModel('claude-brand-new-9')).toBe('brand-new-9');
+  it('names a model released after this code was written', () => {
+    // Derived from the id's shape, so no table update is needed.
+    expect(prettyModel('claude-brand-new-9')).toBe('Brand New 9');
+    expect(prettyModel('claude-opus-7-2')).toBe('Opus 7.2');
     expect(prettyModel('<synthetic>')).toBeUndefined();
     expect(prettyModel(undefined)).toBeUndefined();
   });

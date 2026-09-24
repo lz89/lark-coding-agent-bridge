@@ -42,6 +42,10 @@ export function ConfigView({ profile }: { profile: string }) {
   // chat_id → display name, for the allowed-chats list. Seeded from the bot's
   // known chats and topped up with names captured when adding from the picker.
   const [chatNames, setChatNames] = useState<Record<string, string>>({});
+  // A model id typed by hand (anything `claude --model` accepts, e.g. a model
+  // newer than the picker's catalog, or the `opus` alias). Non-empty wins over
+  // the picker on save; cleared once the server echoes it back as an option.
+  const [customModel, setCustomModel] = useState("");
 
   const load = () =>
     apiGet<ConfigData>(`/api/config?profile=${encodeURIComponent(profile)}`)
@@ -78,7 +82,7 @@ export function ConfigView({ profile }: { profile: string }) {
       const next = await apiPost<ConfigData>(`/api/config?profile=${encodeURIComponent(profile)}`, {
         mode: cfg.mode,
         meeting: cfg.meeting,
-        model: cfg.model,
+        model: customModel.trim() || cfg.model,
         messageReply: cfg.messageReply,
         showToolCalls: cfg.showToolCalls,
         cotMessages: cfg.cotMessages,
@@ -88,6 +92,7 @@ export function ConfigView({ profile }: { profile: string }) {
         larkCliIdentity: cfg.larkCliIdentity,
       });
       setCfg(next);
+      setCustomModel("");
       toast.success(next.live ? "已保存，立即生效" : "已保存，下次启动该 profile 生效");
     } catch (e) {
       toast.error(String((e as Error).message ?? e));
@@ -145,6 +150,11 @@ export function ConfigView({ profile }: { profile: string }) {
           <Field label="模型">
             <SelectRow value={cfg.model} onChange={(v) => set("model", v)}
               options={cfg.models.map((m) => [m.value, m.label])} />
+          </Field>
+          <Field label="自定义模型 ID（可选）"
+            hint="列表里没有的新模型直接填 ID，如 claude-opus-5-5；填别名 opus / sonnet / fable 则自动跟随该系列最新版。填写后优先于上面的选择；留空则用上面的选择。">
+            <Input value={customModel} placeholder="claude-opus-5-5 或 opus"
+              onChange={(e) => setCustomModel(e.target.value)} />
           </Field>
           <Field label="消息回复方式">
             <SelectRow value={cfg.messageReply} onChange={(v) => set("messageReply", v as ConfigData["messageReply"])}

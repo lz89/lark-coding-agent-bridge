@@ -1,4 +1,5 @@
 import type { RunMeta } from './run-state';
+import { formatModelName } from '../agent/models';
 
 /**
  * The per-reply footer: `🧠 403K · Fable 5 · max`.
@@ -8,35 +9,18 @@ import type { RunMeta } from './run-state';
  * `undefined` when there is nothing worth showing.
  */
 
-/** Display names for model ids the picker offers. */
-const MODEL_NAMES: Record<string, string> = {
-  'claude-fable-5': 'Fable 5',
-  'claude-mythos-5': 'Mythos 5',
-  'claude-opus-5': 'Opus 5',
-  'claude-opus-4-8': 'Opus 4.8',
-  'claude-opus-4-7': 'Opus 4.7',
-  'claude-opus-4-6': 'Opus 4.6',
-  'claude-sonnet-5': 'Sonnet 5',
-  'claude-sonnet-4-6': 'Sonnet 4.6',
-  'claude-haiku-4-5': 'Haiku 4.5',
-  opusplan: 'Opus Plan',
-};
-
 const MODEL_CAP = 32;
 
 /**
- * Model id → display name. Unknown ids keep their own text (minus the noisy
- * `claude-` prefix) rather than being dropped: a model shipped after this table
- * was written should still be named on the footer, just less prettily.
+ * Model id → display name, derived from the id itself (see
+ * {@link formatModelName}) so a model shipped after this code was written is
+ * still named properly on the footer.
  */
 export function prettyModel(id: string | undefined): string | undefined {
   if (typeof id !== 'string') return undefined;
   const trimmed = id.trim();
   if (!trimmed || trimmed === '<synthetic>') return undefined;
-  const known = MODEL_NAMES[trimmed];
-  if (known) return known;
-  const stripped = trimmed.startsWith('claude-') ? trimmed.slice('claude-'.length) : trimmed;
-  return stripped.slice(0, MODEL_CAP) || undefined;
+  return formatModelName(trimmed).slice(0, MODEL_CAP) || undefined;
 }
 
 /** `403K`, or `1.2M` past a million. Below 1K is shown exactly. */

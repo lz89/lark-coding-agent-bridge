@@ -1,4 +1,4 @@
-import { modelLabel, supportedModels } from '../agent/models';
+import { modelLabel, modelOptions, supportedModels } from '../agent/models';
 import type { KnownChat } from '../bot/lark-info';
 import type { AgentKind, LarkCliIdentityPreset, ProfileMode } from '../config/profile-schema';
 import type { CotMessagesMode, MessageReplyMode } from '../config/schema';
@@ -160,13 +160,14 @@ export function configFormCard(opts: ConfigFormOpts): object {
               content:
                 '**模型**\n' +
                 '_底层 agent 运行使用的模型_\n' +
-                '_「跟随默认」= 不指定,由 CLI/账号决定_',
+                '_「跟随默认」= 不指定,由 CLI/账号决定_\n' +
+                '_列表外的新模型:在网页控制台填模型 ID(如 claude-opus-5-5),或填别名 opus 自动跟随最新_',
             },
             {
               tag: 'select_static',
               name: 'model',
               initial_option: opts.model,
-              options: supportedModels(opts.agentKind).map((m) => ({
+              options: modelOptions(opts.agentKind, opts.model).map((m) => ({
                 text: { tag: 'plain_text', content: m.label },
                 value: m.value,
               })),
