@@ -2,7 +2,11 @@ import { describe, expect, it } from 'vitest';
 import {
   DEFAULT_MODEL,
   isDefaultModel,
+  formatModelName,
+  isClaudeModelId,
+  isSelectableModel,
   modelLabel,
+  modelOptions,
   normalizeModelSelection,
   resolveModelArg,
   supportedModels,
@@ -45,5 +49,57 @@ describe('agent model catalog', () => {
     expect(modelLabel('claude', 'claude-opus-4-8')).toBe('Opus 4.8');
     expect(modelLabel('claude', 'claude-fable-5')).toContain('Fable 5');
     expect(modelLabel('claude', DEFAULT_MODEL)).toContain('跟随默认');
+  });
+});
+
+describe('models outside the catalog', () => {
+  it('recognises Claude ids and aliases by shape', () => {
+    expect(isClaudeModelId('claude-opus-5-5')).toBe(true);
+    expect(isClaudeModelId('claude-fable-5-1[1m]')).toBe(true);
+    expect(isClaudeModelId('claude-haiku-4-5-20251001')).toBe(true);
+    expect(isClaudeModelId('opus')).toBe(true);
+    expect(isClaudeModelId('Sonnet')).toBe(true);
+    expect(isClaudeModelId('claude-opus 5')).toBe(false);
+    expect(isClaudeModelId('claude-')).toBe(false);
+    expect(isClaudeModelId('claude-opus')).toBe(false); // no version segment
+    expect(isClaudeModelId('gpt-5-codex')).toBe(false);
+    expect(isClaudeModelId('claude-opus-5;rm -rf /')).toBe(false);
+    expect(isClaudeModelId('')).toBe(false);
+  });
+
+  it('forwards a well-formed id that is not in the catalog, so new models need no code change', () => {
+    expect(normalizeModelSelection('claude', 'claude-opus-9-9')).toBe('claude-opus-9-9');
+    expect(resolveModelArg('claude', 'claude-opus-9-9')).toBe('claude-opus-9-9');
+    expect(resolveModelArg('claude', 'opus')).toBe('opus');
+    expect(resolveModelArg('claude', ' claude-opus-5-5 ')).toBe('claude-opus-5-5');
+    expect(isSelectableModel('claude', 'claude-opus-9-9')).toBe(true);
+    expect(isSelectableModel('claude', DEFAULT_MODEL)).toBe(true);
+  });
+
+  it('still drops malformed values and never passes Claude ids through for codex', () => {
+    expect(resolveModelArg('claude', 'bogus')).toBeUndefined();
+    expect(resolveModelArg('claude', 'claude-opus 5')).toBeUndefined();
+    expect(resolveModelArg('codex', 'claude-opus-9-9')).toBeUndefined();
+    expect(isSelectableModel('claude', 'bogus')).toBe(false);
+    expect(isSelectableModel('codex', 'gpt-5-codex')).toBe(true);
+  });
+
+  it('derives a display name from the id alone', () => {
+    expect(formatModelName('claude-opus-5-5')).toBe('Opus 5.5');
+    expect(formatModelName('claude-opus-5')).toBe('Opus 5');
+    expect(formatModelName('claude-fable-5-1[1m]')).toBe('Fable 5.1 [1M]');
+    expect(formatModelName('claude-haiku-4-5-20251001')).toBe('Haiku 4.5');
+    expect(formatModelName('opus')).toBe('Opus（跟随最新）');
+    expect(formatModelName('opusplan')).toBe('Opus Plan');
+    expect(modelLabel('claude', 'claude-opus-9-9')).toBe('Opus 9.9');
+  });
+
+  it('keeps the current pass-through id in the picker so the card stays valid', () => {
+    const opts = modelOptions('claude', 'claude-opus-9-9');
+    expect(opts.slice(0, -1)).toEqual(supportedModels('claude'));
+    expect(opts.at(-1)).toEqual({ value: 'claude-opus-9-9', label: 'Opus 9.9（自定义）' });
+    expect(modelOptions('claude', 'claude-opus-4-8')).toEqual(supportedModels('claude'));
+    expect(modelOptions('claude', undefined)).toEqual(supportedModels('claude'));
+    expect(modelOptions('claude', 'bogus')).toEqual(supportedModels('claude'));
   });
 });

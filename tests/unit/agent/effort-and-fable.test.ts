@@ -13,17 +13,25 @@ describe('model catalog', () => {
     const values = supportedModels('claude').map((m) => m.value);
     expect(values).toContain('claude-fable-5');
     expect(values).toContain('claude-opus-5');
+    expect(values).toContain('claude-opus-5-5');
   });
 
   it('forwards a catalogued model verbatim', () => {
     expect(resolveModelArg('claude', 'claude-fable-5')).toBe('claude-fable-5');
+    expect(resolveModelArg('claude', 'claude-opus-5-5')).toBe('claude-opus-5-5');
   });
 
-  it('drops an uncatalogued model rather than forwarding it', () => {
-    // The silent-coercion trap: a model written straight into config.json but
-    // missing from the catalog is dropped, and the run quietly uses the
-    // account default instead of erroring.
-    expect(resolveModelArg('claude', 'claude-not-a-model')).toBeUndefined();
+  it('forwards an uncatalogued but well-formed model verbatim', () => {
+    // A model written straight into config.json (e.g. one released after this
+    // catalog) must reach `--model`; the CLI / API validates it and the run
+    // surfaces any error instead of silently using the account default.
+    expect(resolveModelArg('claude', 'claude-opus-7-2')).toBe('claude-opus-7-2');
+    expect(resolveModelArg('claude', 'claude-not-a-model')).toBe('claude-not-a-model');
+  });
+
+  it('drops a value that cannot be a Claude model id', () => {
+    expect(resolveModelArg('claude', 'not a model')).toBeUndefined();
+    expect(resolveModelArg('claude', 'gpt-5')).toBeUndefined();
   });
 
   it('does not offer Claude models to a codex profile', () => {
