@@ -1,7 +1,7 @@
 import { chmod, mkdtemp, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { afterEach, describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import { ClaudeAdapter } from '../../../src/agent/claude/adapter.js';
 import { translateEvent } from '../../../src/agent/claude/stream-json.js';
 import type { AgentEvent } from '../../../src/agent/types.js';
@@ -153,6 +153,34 @@ describe('Claude stream-json translator', () => {
     expect(usage).toMatchObject({ type: 'usage', contextTokens: undefined });
   });
 
+  it('reads plain-string message content as a single text block', () => {
+    // The CLI replays user lines it injects itself (e.g. a background task's
+    // notification) with string content, not an array. Seen in production as
+    // `evt.message.content.filter is not a function`, which failed the run.
+    expect([
+      ...translateEvent({
+        type: 'user',
+        isReplay: true,
+        uuid: 'cli-injected',
+        message: { role: 'user', content: '<task-notification>done</task-notification>' },
+      }),
+    ]).toEqual([{ type: 'user_input', uuid: 'cli-injected', text: '<task-notification>done</task-notification>' }]);
+    expect([...translateEvent({ type: 'user', message: { content: 'no tool result here' } })]).toEqual([]);
+    expect([...translateEvent({ type: 'assistant', message: { content: 'plain reply' } })]).toEqual([
+      { type: 'text', delta: 'plain reply' },
+    ]);
+  });
+
+  it('never throws on content that is neither an array nor a string', () => {
+    for (const content of [42, true, { type: 'text', text: 'x' }, [null, 'x', 7, { text: 'no type' }]]) {
+      expect(() => [...translateEvent({ type: 'assistant', message: { content } })]).not.toThrow();
+      expect([...translateEvent({ type: 'assistant', message: { content } })]).toEqual([]);
+      expect([
+        ...translateEvent({ type: 'user', isReplay: true, uuid: 'u', message: { content } }),
+      ]).toEqual([{ type: 'user_input', uuid: 'u', text: '' }]);
+    }
+  });
+
   it('ignores unknown, empty, and incomplete raw events', () => {
     expect([...translateEvent(null)]).toEqual([]);
     expect([...translateEvent({ type: 'assistant', message: { content: [{ type: 'text', text: '' }] } })]).toEqual([]);
@@ -191,6 +219,72 @@ describe('Claude stream-json reader behavior', () => {
         message: `claude exited with code 7: ${stderr}`,
         terminationReason: 'failed',
       },
+    ]);
+  });
+
+  it('drops a whole line whose translation throws midway and keeps reading', async () => {
+    // Defence in depth: whatever the translator yielded before throwing is
+    // discarded with the line, and the stream carries on to the result.
+    vi.resetModules();
+    vi.doMock('../../../src/agent/claude/stream-json', async (importOriginal) => {
+      const actual = await importOriginal<typeof import('../../../src/agent/claude/stream-json.js')>();
+      return {
+        ...actual,
+        *translateEvent(raw: unknown) {
+          if ((raw as { poison?: boolean } | null)?.poison) {
+            yield { type: 'text', delta: 'partial' } as AgentEvent;
+            throw new Error('translator blew up');
+          }
+          yield* actual.translateEvent(raw);
+        },
+      };
+    });
+    try {
+      const { ClaudeAdapter: MockedAdapter } = await import('../../../src/agent/claude/adapter.js');
+      const binary = await createFakeBinary([
+        JSON.stringify({ type: 'assistant', poison: true, message: { content: [] } }),
+        JSON.stringify({ type: 'assistant', message: { content: [{ type: 'text', text: 'after' }] } }),
+        JSON.stringify({ type: 'result', session_id: 'sess-p' }),
+      ], 0, '');
+      cleanup = binary.cleanup;
+      const run = new MockedAdapter({ binary: binary.path }).run({ runId: 'run-poison', prompt: 'hi', cwd: tmpdir() });
+      expect(await collect(run.events)).toEqual([
+        { type: 'text', delta: 'after' },
+        { type: 'done', sessionId: 'sess-p', terminationReason: 'normal' },
+      ]);
+    } finally {
+      vi.doUnmock('../../../src/agent/claude/stream-json');
+      vi.resetModules();
+    }
+  });
+
+  it('finishes normally when the CLI replays a string-content user line it injected itself', async () => {
+    // Production shape (lin, 2026-11-02): the run's reply was complete, then the
+    // CLI echoed a self-injected user line with string content; the run used to
+    // fail with `evt.message.content.filter is not a function`.
+    const binary = await createFakeBinary([
+      JSON.stringify({ type: 'assistant', message: { content: [{ type: 'text', text: 'answer' }] } }),
+      JSON.stringify({
+        type: 'user',
+        isReplay: true,
+        uuid: 'cli-injected',
+        message: { role: 'user', content: '<task-notification>bg done</task-notification>' },
+      }),
+      'null',
+      JSON.stringify({ type: 'result', session_id: 'sess-x' }),
+    ], 0, '');
+    cleanup = binary.cleanup;
+
+    const run = new ClaudeAdapter({ binary: binary.path }).run({
+      runId: 'run-string-replay',
+      prompt: 'hi',
+      cwd: tmpdir(),
+    });
+    const events = await collect(run.events);
+
+    expect(events).toEqual([
+      { type: 'text', delta: 'answer' },
+      { type: 'done', sessionId: 'sess-x', terminationReason: 'normal' },
     ]);
   });
 });

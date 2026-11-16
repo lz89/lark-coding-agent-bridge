@@ -7,9 +7,32 @@ import {
   AgentPreflightError,
   checkAgentVersion,
   formatAgentPreflightError,
+  getAgentPreflightDiagnostic,
 } from '../../../src/agent/preflight.js';
 
 describe('agent preflight diagnostics', () => {
+  it('finds a diagnostic through a cause chain and terminates on a cyclic one', () => {
+    const diagnostic = {
+      code: 'agent-version-check-timeout',
+      agentId: 'claude',
+      agentName: 'Claude Code',
+      command: 'claude',
+    };
+    const inner = new Error('inner') as Error & { diagnostic?: unknown };
+    inner.diagnostic = diagnostic;
+    const outer = new Error('outer', { cause: new Error('middle', { cause: inner }) });
+    expect(getAgentPreflightDiagnostic(outer)).toBe(diagnostic);
+
+    // `err.cause = err` and longer loops used to recurse until the stack overflowed.
+    const selfLoop = new Error('self') as Error & { cause?: unknown };
+    selfLoop.cause = selfLoop;
+    expect(getAgentPreflightDiagnostic(selfLoop)).toBeUndefined();
+    const a = new Error('a') as Error & { cause?: unknown };
+    const b = new Error('b', { cause: a });
+    a.cause = b;
+    expect(getAgentPreflightDiagnostic(a)).toBeUndefined();
+  });
+
   afterEach(() => {
     vi.doUnmock('../../../src/platform/spawn');
     vi.resetModules();

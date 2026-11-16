@@ -262,6 +262,45 @@ describe('profile logger observability', () => {
     delete process.env.LARK_CHANNEL_TELEMETRY_MODULE;
   });
 
+  it('never hands telemetry a raw or cyclic object under an id key', async () => {
+    const tmp = await createTmpProfile('logger-telemetry-cyclic-id-');
+    cleanups.push(tmp.cleanup);
+    const adapterPath = join(tmp.root, 'telemetry-adapter.mjs');
+    await writeFile(
+      adapterPath,
+      `
+        globalThis.__bridgeCyclicEvents = [];
+        globalThis.__bridgeCyclicErrors = [];
+        export function createAdapter() {
+          return {
+            emit(event) { globalThis.__bridgeCyclicEvents.push(event); },
+            recordError(err, ctx) { globalThis.__bridgeCyclicErrors.push({ err, ctx }); },
+            recordMetric() {},
+          };
+        }
+      `,
+    );
+    process.env.LARK_CHANNEL_TELEMETRY_MODULE = pathToFileURL(adapterPath).href;
+    await loadTelemetryAdapter({ version: 'test', appId: 'cli_x', tenant: 'feishu', hostname: 'host' });
+    configureLogger({ logsDir: join(tmp.profile, 'logs'), now: () => new Date('2026-05-25T00:00:00.000Z') });
+
+    const cyclic: Record<string, unknown> = { open_id: 'ou_1234567890' };
+    cyclic.self = cyclic;
+    expect(() => log.warn('intake', 'odd-sender', { sender: cyclic })).not.toThrow();
+    expect(() => reportError(new Error('x'), { sender: cyclic })).not.toThrow();
+    await flushLogger();
+
+    const globals = globalThis as typeof globalThis & {
+      __bridgeCyclicEvents?: unknown[];
+      __bridgeCyclicErrors?: unknown[];
+    };
+    // Serializable at all means no raw cycle reached the adapter.
+    const text = JSON.stringify({ events: globals.__bridgeCyclicEvents, errors: globals.__bridgeCyclicErrors });
+    expect(text).toContain('[Circular]');
+
+    delete process.env.LARK_CHANNEL_TELEMETRY_MODULE;
+  });
+
   it('sanitizes optional telemetry metric tags', async () => {
     const tmp = await createTmpProfile('logger-telemetry-metric-');
     cleanups.push(tmp.cleanup);
