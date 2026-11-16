@@ -283,6 +283,7 @@ async function* createEventStream(
       } catch {
         continue;
       }
+      if (!parsed || typeof parsed !== 'object') continue;
       if ((parsed as { type?: unknown }).type === 'result') {
         if (terminalYielded) {
           log.warn('agent', 'result-after-done', { pid: child.pid ?? null });
@@ -310,7 +311,21 @@ async function* createEventStream(
         yield { type: 'done', sessionId, terminationReason: 'normal' };
         continue;
       }
-      for (const evt of translateEvent(parsed)) {
+      // Translate the whole line before yielding any of it: a line the
+      // translator cannot read is skipped with a warning instead of failing a
+      // run whose real work may already be done.
+      let translated: AgentEvent[];
+      try {
+        translated = [...translateEvent(parsed)];
+      } catch (err) {
+        log.warn('agent', 'stream-line-untranslatable', {
+          pid: child.pid ?? null,
+          lineType: String((parsed as { type?: unknown } | null)?.type ?? ''),
+          message: err instanceof Error ? err.message : String(err),
+        });
+        continue;
+      }
+      for (const evt of translated) {
         if (evt.type === 'user_input') {
           // The prompt itself is replayed too; only a handed-over message is a
           // receipt anyone is waiting for.

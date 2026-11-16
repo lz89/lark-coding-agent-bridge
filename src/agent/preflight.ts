@@ -266,11 +266,18 @@ export function formatAgentPreflightDiagnostic(diagnostic: AgentPreflightDiagnos
 }
 
 export function getAgentPreflightDiagnostic(err: unknown): AgentPreflightDiagnostic | undefined {
-  if (err instanceof AgentPreflightError) return err.diagnostic;
-  if (!err || typeof err !== 'object') return undefined;
-  const diagnostic = (err as { diagnostic?: unknown }).diagnostic;
-  if (isAgentPreflightDiagnostic(diagnostic)) return diagnostic;
-  return getAgentPreflightDiagnostic((err as { cause?: unknown }).cause);
+  // Walk the `cause` chain iteratively; a chain that loops back on itself
+  // (`err.cause = err`, or longer) must end, not overflow the stack.
+  const seen = new Set<object>();
+  let current: unknown = err;
+  while (current && typeof current === 'object' && !seen.has(current)) {
+    if (current instanceof AgentPreflightError) return current.diagnostic;
+    seen.add(current);
+    const diagnostic = (current as { diagnostic?: unknown }).diagnostic;
+    if (isAgentPreflightDiagnostic(diagnostic)) return diagnostic;
+    current = (current as { cause?: unknown }).cause;
+  }
+  return undefined;
 }
 
 export function isAgentPreflightDiagnostic(input: unknown): input is AgentPreflightDiagnostic {

@@ -193,10 +193,25 @@ function sanitizeLogEntry(
   return out;
 }
 
+/**
+ * How deep the sanitizer follows nested objects. Log fields are shallow by
+ * design; anything deeper is an SDK/HTTP object passed through by accident.
+ */
+const MAX_LOG_DEPTH = 12;
+
+/**
+ * `ancestors` holds the objects on the current path only (added on the way
+ * down, removed on the way back up), so a cycle becomes `[Circular]` while an
+ * object merely referenced twice is still rendered both times. Without it an
+ * SDK error with a self-reference overflowed the stack inside a `log.*` call
+ * and took the surrounding run down with it.
+ */
 function sanitizeLogValue(
   key: string,
   value: unknown,
   options: SanitizeOptions = EXTERNAL_SANITIZE,
+  ancestors: WeakSet<object> = new WeakSet(),
+  depth = 0,
 ): unknown {
   const normalizedKey = key.startsWith('_') ? key.slice(1) : key;
   if (value === undefined) return undefined;
@@ -206,16 +221,27 @@ function sanitizeLogValue(
     return '[REDACTED_PATH]';
   }
   if (RESOURCE_ID_KEYS.has(normalizedKey)) return '[REDACTED_RESOURCE]';
-  if (options.redactIds && ID_KEYS.has(normalizedKey)) return redactId(value);
-  if (Array.isArray(value)) {
-    return value.map((item) => sanitizeLogValue(key, item, options));
+  // An id is a scalar; an object under an id key is sanitized like any other
+  // object below (cycle- and depth-safe) rather than passed through raw.
+  if (options.redactIds && ID_KEYS.has(normalizedKey) && (value === null || typeof value !== 'object')) {
+    return redactId(value);
   }
   if (value && typeof value === 'object') {
-    const nested: Record<string, unknown> = {};
-    for (const [nestedKey, nestedValue] of Object.entries(value)) {
-      nested[nestedKey] = sanitizeLogValue(nestedKey, nestedValue, options);
+    if (ancestors.has(value)) return '[Circular]';
+    if (depth >= MAX_LOG_DEPTH) return '[MaxDepth]';
+    ancestors.add(value);
+    try {
+      if (Array.isArray(value)) {
+        return value.map((item) => sanitizeLogValue(key, item, options, ancestors, depth + 1));
+      }
+      const nested: Record<string, unknown> = {};
+      for (const [nestedKey, nestedValue] of Object.entries(value)) {
+        nested[nestedKey] = sanitizeLogValue(nestedKey, nestedValue, options, ancestors, depth + 1);
+      }
+      return nested;
+    } finally {
+      ancestors.delete(value);
     }
-    return nested;
   }
   if (typeof value === 'string') {
     const redacted = redactDiagnosticText(value);
@@ -233,7 +259,57 @@ function redactId(value: unknown): unknown {
   return `...${value.slice(-6)}`;
 }
 
+/**
+ * Logging must never throw into the caller: a `log.*` call sits inside run,
+ * flush and error-reporting paths, and an exception there replaces the real
+ * outcome with a logging failure. Anything that escapes is reduced to a
+ * minimal record.
+ */
 function emit(level: Level, phase: string, event: string, fields: LogFields = {}): void {
+  try {
+    emitUnchecked(level, phase, event, fields);
+  } catch (err) {
+    try {
+      const message = safeLogErrorMessage(err);
+      // Same redaction the normal path applies to every string in the entry.
+      const safePhase = safeLogErrorMessage(phase);
+      const safeEvent = safeLogErrorMessage(event);
+      getStream()?.write(
+        `${JSON.stringify({
+          ts: formatLocalTimestamp(loggerOptions.now()),
+          level,
+          phase: safePhase,
+          event: safeEvent,
+          logError: message.slice(0, MAX_LOG_STRING_CHARS),
+        })}\n`,
+      );
+      console.error(`✗ [log.emit-failed] ${safePhase}.${safeEvent}: ${message.slice(0, 200)}`);
+    } catch {
+      /* never break the caller */
+    }
+  }
+}
+
+/**
+ * The failure of a log call, as text that is safe to write: converting an
+ * arbitrary thrown value can itself throw (e.g. a null-prototype object), and
+ * the message may quote the very field that could not be sanitized.
+ */
+function safeLogErrorMessage(err: unknown): string {
+  let message: string;
+  try {
+    message = err instanceof Error ? String(err.message) : String(err);
+  } catch {
+    message = 'unprintable error';
+  }
+  try {
+    return redactDiagnosticText(message);
+  } catch {
+    return 'unprintable error';
+  }
+}
+
+function emitUnchecked(level: Level, phase: string, event: string, fields: LogFields): void {
   const ctx = als.getStore() ?? {};
   const entry = sanitizeLogEntry({
     ts: formatLocalTimestamp(loggerOptions.now()),

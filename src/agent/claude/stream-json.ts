@@ -26,7 +26,12 @@ interface ClaudeRawEvent {
   session_id?: string;
   cwd?: string;
   model?: string;
-  message?: { content?: ContentBlock[] };
+  /**
+   * Usually an array of blocks, but the CLI also emits plain-string content —
+   * seen on replayed `user` lines it injects itself (e.g. a background task's
+   * notification arriving while a run winds down). Read it via `contentBlocks`.
+   */
+  message?: { content?: unknown };
   usage?: {
     input_tokens?: number;
     output_tokens?: number;
@@ -66,7 +71,7 @@ export function* translateEvent(raw: unknown): Generator<AgentEvent> {
   }
 
   if (evt.type === 'assistant' && evt.message?.content) {
-    for (const block of evt.message.content) {
+    for (const block of contentBlocks(evt.message.content)) {
       if (block.type === 'text' && typeof block.text === 'string' && block.text) {
         yield { type: 'text', delta: block.text };
       } else if (block.type === 'thinking' && typeof block.thinking === 'string' && block.thinking) {
@@ -79,15 +84,16 @@ export function* translateEvent(raw: unknown): Generator<AgentEvent> {
   }
 
   if (evt.type === 'user' && evt.message?.content) {
+    const blocks = contentBlocks(evt.message.content);
     if (evt.isReplay === true && typeof evt.uuid === 'string' && evt.uuid) {
-      const text = evt.message.content
+      const text = blocks
         .filter((block) => block.type === 'text' && typeof block.text === 'string')
         .map((block) => block.text as string)
         .join('\n');
       yield { type: 'user_input', uuid: evt.uuid, text };
       return;
     }
-    for (const block of evt.message.content) {
+    for (const block of blocks) {
       if (block.type === 'tool_result' && block.tool_use_id) {
         const output =
           typeof block.content === 'string' ? block.content : JSON.stringify(block.content);
@@ -107,6 +113,20 @@ export function* translateEvent(raw: unknown): Generator<AgentEvent> {
     if (usage) yield usage;
     yield { type: 'done', sessionId: evt.session_id, terminationReason: 'normal' };
   }
+}
+
+/**
+ * A message's content as blocks, whatever shape the CLI sent it in: an array
+ * keeps its object entries, a plain string is one text block, anything else is
+ * empty. Never throws — one odd line must not take down a run's stream.
+ */
+function contentBlocks(content: unknown): ContentBlock[] {
+  if (typeof content === 'string') return content ? [{ type: 'text', text: content }] : [];
+  if (!Array.isArray(content)) return [];
+  return content.filter(
+    (block): block is ContentBlock =>
+      !!block && typeof block === 'object' && typeof (block as ContentBlock).type === 'string',
+  );
 }
 
 /**

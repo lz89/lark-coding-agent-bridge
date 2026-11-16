@@ -110,6 +110,75 @@ describe('logger redaction', () => {
     expect(text).toContain('[REDACTED_PATH]');
   });
 
+  it('logs a self-referencing field as [Circular] instead of overflowing the stack', async () => {
+    // Shape of an SDK/HTTP error that points back at itself. This used to throw
+    // `Maximum call stack size exceeded` out of the log call and fail the run.
+    const sdkError: Record<string, unknown> = { message: 'Request failed with status code 400' };
+    sdkError.self = sdkError;
+    const shared = { code: 99991672 };
+    expect(() =>
+      log.warn('sdk', 'error', { args: [sdkError, { a: shared, b: shared }] }),
+    ).not.toThrow();
+    await flushLogger();
+
+    const entry = JSON.parse((await readTodayLog()).trim().split('\n').pop() ?? '{}');
+    expect(entry.args[0]).toEqual({ message: 'Request failed with status code 400', self: '[Circular]' });
+    // Referenced twice but not a cycle: rendered both times.
+    expect(entry.args[1]).toEqual({ a: { code: 99991672 }, b: { code: 99991672 } });
+  });
+
+  it('caps nesting depth and keeps logging', async () => {
+    let deep: Record<string, unknown> = { leaf: true };
+    for (let i = 0; i < 50; i += 1) deep = { next: deep };
+    expect(() => log.info('agent', 'deep', { deep })).not.toThrow();
+    await flushLogger();
+    expect(await readTodayLog()).toContain('[MaxDepth]');
+  });
+
+  it('never throws from a log call, even when a field cannot be read', async () => {
+    const hostile = {
+      get boom(): never {
+        throw new Error('getter exploded');
+      },
+    };
+    expect(() => log.warn('agent', 'hostile', { hostile })).not.toThrow();
+    expect(() => log.fail('flush', new Error('real failure'), { hostile })).not.toThrow();
+    await flushLogger();
+    const text = await readTodayLog();
+    expect(text).toContain('"logError":"getter exploded"');
+    expect(text).toContain('"event":"hostile"');
+  });
+
+  it('keeps the log-failure record itself safe: unprintable throws and secrets in the message', async () => {
+    const unprintable = {
+      get boom(): never {
+        // A null-prototype object makes String(err) throw too.
+        throw Object.create(null);
+      },
+    };
+    const leaky = {
+      get boom(): never {
+        throw new Error('Authorization: Bearer leak-token-999 at /Users/example/private/repo');
+      },
+    };
+    expect(() => log.warn('agent', 'unprintable', { unprintable })).not.toThrow();
+    expect(() => log.warn('agent', 'leaky', { leaky })).not.toThrow();
+    expect(() => log.warn('phase token=phase-secret-1', 'token=event-secret-2', { leaky })).not.toThrow();
+    await flushLogger();
+
+    const text = await readTodayLog();
+    expect(text).toContain('"logError":"unprintable error"');
+    expect(text).not.toContain('leak-token-999');
+    expect(text).not.toContain('phase-secret-1');
+    expect(text).not.toContain('event-secret-2');
+    expect(text).not.toContain('/Users/example/private/repo');
+    const printed = vi.mocked(console.error).mock.calls.flat().join('\n');
+    expect(printed).not.toContain('leak-token-999');
+    expect(printed).not.toContain('/Users/example/private/repo');
+    expect(printed).not.toContain('phase-secret-1');
+    expect(printed).not.toContain('event-secret-2');
+  });
+
   it('sanitizes doctor log buffers with stderr urls and absolute paths', () => {
     const out = sanitizeLogsForDoctor(
       '{"stderr":"failed /Users/example/work/repo?app_access_token=app-secret","cwd":"/opt/private/repo","authorization":"Bearer raw-token"}',
